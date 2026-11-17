@@ -1568,6 +1568,24 @@ static void updateHashChain(Hash* hash, size_t wpos, unsigned hashval, unsigned 
 }
 
 /*
+Insert all positions in [begin, end) into the LZ77 hash chains without emitting
+anything for them. Used to seed the matcher with a preset dictionary: the
+positions become available as backward references for the data that follows.
+This mirrors the per-position hash update done by encodeLZ77.
+*/
+static void lodepng_hash_insert_range(Hash* hash, const unsigned char* in, size_t insize,
+                                      size_t begin, size_t end, unsigned windowsize) {
+  size_t pos;
+  for(pos = begin; pos < end; ++pos) {
+    size_t wpos = pos & (windowsize - 1);
+    unsigned hashval = getHash(in, insize, pos);
+    unsigned numzeros = 0;
+    if(hashval == 0) numzeros = countZeros(in, insize, pos);
+    updateHashChain(hash, wpos, hashval, (unsigned short)numzeros);
+  }
+}
+
+/*
 LZ77-encode the data. Return value is error code. The input are raw bytes, the output
 is in the form of unsigned integers with codes representing for example literal bytes, or
 length/distance pairs.
@@ -2057,12 +2075,24 @@ static unsigned deflateFixed(LodePNGBitWriter* writer, Hash* hash,
   return error;
 }
 
+/*
+Deflate the data. If dictsize is nonzero, the dict bytes are treated as a
+preset dictionary: they are prepended to the LZ77 window (so backward
+references may point into them, up to windowsize bytes back) but are never
+emitted themselves. With dictsize == 0 this behaves exactly as the regular
+no-dictionary deflation.
+*/
 static unsigned lodepng_deflatev(ucvector* out, const unsigned char* in, size_t insize,
-                                 const LodePNGCompressSettings* settings) {
+                                 const LodePNGCompressSettings* settings,
+                                 const unsigned char* dict, size_t dictsize) {
   unsigned error = 0;
   size_t i, blocksize, numdeflateblocks;
   Hash hash;
   LodePNGBitWriter writer;
+  unsigned char* cat = 0;
+  const unsigned char* data = in;
+  size_t datastart = 0; /*position in data where the real input starts (after any preset dictionary)*/
+  size_t datasize = insize;
 
   LodePNGBitWriter_init(&writer, out);
 
@@ -2079,21 +2109,41 @@ static unsigned lodepng_deflatev(ucvector* out, const unsigned char* in, size_t 
   numdeflateblocks = (insize + blocksize - 1) / blocksize;
   if(numdeflateblocks == 0) numdeflateblocks = 1;
 
+  if(dictsize != 0) {
+    /*Prepend the dictionary to the input so the regular matcher can reference
+    it with ordinary backward distances. Only positions >= dictsize get emitted.*/
+    if(lodepng_addofls(dictsize, insize)) return 83; /*overflow: treated as alloc fail*/
+    cat = (unsigned char*)lodepng_malloc(dictsize + insize);
+    if(!cat) return 83; /*alloc fail*/
+    lodepng_memcpy(cat, dict, dictsize);
+    lodepng_memcpy(cat + dictsize, in, insize);
+    data = cat;
+    datastart = dictsize;
+    datasize = dictsize + insize;
+  }
+
   error = hash_init(&hash, settings->windowsize);
+
+  if(!error && dictsize != 0) {
+    /*seed the hash chains with the dictionary content (only the last
+    windowsize bytes of it are effectively reachable by backward distances)*/
+    lodepng_hash_insert_range(&hash, data, datasize, 0, dictsize, settings->windowsize);
+  }
 
   if(!error) {
     for(i = 0; i != numdeflateblocks && !error; ++i) {
       unsigned final = (i == numdeflateblocks - 1);
-      size_t start = i * blocksize;
+      size_t start = datastart + i * blocksize;
       size_t end = start + blocksize;
-      if(end > insize) end = insize;
+      if(end > datasize) end = datasize;
 
-      if(settings->btype == 1) error = deflateFixed(&writer, &hash, in, start, end, settings, final);
-      else if(settings->btype == 2) error = deflateDynamic(&writer, &hash, in, start, end, settings, final);
+      if(settings->btype == 1) error = deflateFixed(&writer, &hash, data, start, end, settings, final);
+      else if(settings->btype == 2) error = deflateDynamic(&writer, &hash, data, start, end, settings, final);
     }
   }
 
   hash_cleanup(&hash);
+  if(cat) lodepng_free(cat);
 
   return error;
 }
@@ -2102,7 +2152,7 @@ unsigned lodepng_deflate(unsigned char** out, size_t* outsize,
                          const unsigned char* in, size_t insize,
                          const LodePNGCompressSettings* settings) {
   ucvector v = ucvector_init(*out, *outsize);
-  unsigned error = lodepng_deflatev(&v, in, insize, settings);
+  unsigned error = lodepng_deflatev(&v, in, insize, settings, 0, 0);
   *out = v.data;
   *outsize = v.size;
   return error;
@@ -2288,6 +2338,152 @@ static unsigned zlib_compress(unsigned char** out, size_t* outsize, const unsign
 }
 
 #endif /*LODEPNG_COMPILE_ENCODER*/
+
+/* ////////////////////////////////////////////////////////////////////////// */
+/* / Zlib with preset dictionary (shared dictionary batch compression)      / */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*
+The functions below implement RFC 1950 preset-dictionary (FDICT) zlib streams:
+a shared dictionary, stored once separately from the individual compressed
+blobs, is used as the initial LZ77 window content. They are intentionally not
+declared in lodepng.h (the public API is unchanged); users that need them can
+declare them themselves. Notes:
+- custom_zlib/custom_deflate/custom_inflate settings are not used here, the
+  built-in implementation is always used;
+- only the last "windowsize" bytes of the dictionary are reachable by backward
+  references, so the most valuable content should be at the end of the dict;
+- with dictsize == 0 (or dict == NULL) they behave exactly like the regular
+  lodepng_zlib_compress / lodepng_zlib_decompress.
+*/
+
+#ifdef LODEPNG_COMPILE_ENCODER
+
+unsigned lodepng_zlib_compress_dict(unsigned char** out, size_t* outsize,
+                                    const unsigned char* dict, size_t dictsize,
+                                    const unsigned char* in, size_t insize,
+                                    const LodePNGCompressSettings* settings) {
+  size_t i;
+  unsigned error;
+  unsigned char* deflatedata = 0;
+  size_t deflatesize = 0;
+
+  if(dictsize == 0 || dict == 0) {
+    /*empty dictionary: identical to the regular compressor*/
+    return lodepng_zlib_compress(out, outsize, in, insize, settings);
+  }
+
+  {
+    ucvector v = ucvector_init(0, 0);
+    error = lodepng_deflatev(&v, in, insize, settings, dict, dictsize);
+    deflatedata = v.data;
+    deflatesize = v.size;
+  }
+
+  *out = NULL;
+  *outsize = 0;
+  if(!error) {
+    *outsize = deflatesize + 10; /*2 byte zlib header, 4 byte DICTID, 4 byte ADLER32*/
+    *out = (unsigned char*)lodepng_malloc(*outsize);
+    if(!*out) error = 83; /*alloc fail*/
+  }
+
+  if(!error) {
+    unsigned ADLER32 = adler32(in, insize);
+    unsigned DICTID = adler32(dict, dictsize);
+    /*zlib data: 1 byte CMF (CM+CINFO), 1 byte FLG (with FDICT set), 4 byte DICTID
+    (adler32 of the dictionary), deflate data, 4 byte ADLER32 of the decompressed data*/
+    unsigned CMF = 120; /*0b01111000: CM 8, CINFO 7. With CINFO 7, any window size up to 32768 can be used.*/
+    unsigned FLEVEL = 0;
+    unsigned FDICT = 1;
+    unsigned CMFFLG = 256 * CMF + FDICT * 32 + FLEVEL * 64;
+    unsigned FCHECK = 31 - CMFFLG % 31;
+    CMFFLG += FCHECK;
+
+    (*out)[0] = (unsigned char)(CMFFLG >> 8);
+    (*out)[1] = (unsigned char)(CMFFLG & 255);
+    lodepng_set32bitInt(&(*out)[2], DICTID);
+    for(i = 0; i != deflatesize; ++i) (*out)[i + 6] = deflatedata[i];
+    lodepng_set32bitInt(&(*out)[*outsize - 4], ADLER32);
+  }
+
+  lodepng_free(deflatedata);
+  return error;
+}
+
+#endif /*LODEPNG_COMPILE_ENCODER*/
+
+#ifdef LODEPNG_COMPILE_DECODER
+
+unsigned lodepng_zlib_decompress_dict(unsigned char** out, size_t* outsize,
+                                      const unsigned char* dict, size_t dictsize,
+                                      const unsigned char* in, size_t insize,
+                                      const LodePNGDecompressSettings* settings) {
+  ucvector v;
+  unsigned error = 0;
+  unsigned CM, CINFO, FDICT;
+
+  if(insize < 2) return 53; /*error, size of zlib data too small*/
+  /*read information from zlib header*/
+  if((in[0] * 256 + in[1]) % 31 != 0) {
+    /*error: 256 * in[0] + in[1] must be a multiple of 31, the FCHECK value is supposed to be made that way*/
+    return 24;
+  }
+
+  CM = in[0] & 15;
+  CINFO = (in[0] >> 4) & 15;
+  FDICT = (in[1] >> 5) & 1;
+
+  if(CM != 8 || CINFO > 7) {
+    /*error: only compression method 8: inflate with sliding window of 32k is supported*/
+    return 25;
+  }
+
+  if(!FDICT) {
+    /*no preset dictionary in the stream: identical to the regular decompressor*/
+    return lodepng_zlib_decompress(out, outsize, in, insize, settings);
+  }
+
+  if(dictsize == 0 || dict == 0) {
+    /*error 124: the stream has FDICT set but no dictionary was provided*/
+    return 124;
+  }
+  if(insize < 6) return 53; /*error, size of zlib data too small*/
+  if(lodepng_read32bitInt(&in[2]) != adler32(dict, dictsize)) {
+    /*error 125: the provided dictionary does not match the stream's DICTID*/
+    return 125;
+  }
+
+  v = ucvector_init(*out, *outsize);
+  /*prefill the output buffer with the dictionary so that backward references
+  into it resolve correctly; the prefix is stripped again after inflation*/
+  if(!ucvector_resize(&v, v.size + dictsize)) error = 83; /*alloc fail*/
+  if(!error) {
+    lodepng_memcpy(v.data + v.size - dictsize, dict, dictsize);
+    error = lodepng_inflatev(&v, in + 6, insize - 6, settings);
+  }
+  if(v.size >= dictsize) {
+    /*strip the dictionary prefix from the result (forward copy: source is
+    ahead of destination, so overlapping is safe)*/
+    size_t j, n = v.size - dictsize;
+    for(j = 0; j != n; ++j) v.data[j] = v.data[j + dictsize];
+    v.size -= dictsize;
+  } else if(!error) {
+    error = 52; /*cannot happen unless the stream was already corrupt*/
+  }
+
+  if(!error && !settings->ignore_adler32) {
+    unsigned ADLER32 = lodepng_read32bitInt(&in[insize - 4]);
+    unsigned checksum = adler32(v.data, v.size);
+    if(checksum != ADLER32) error = 58; /*error, adler checksum not correct, data must be corrupted*/
+  }
+
+  *out = v.data;
+  *outsize = v.size;
+  return error;
+}
+
+#endif /*LODEPNG_COMPILE_DECODER*/
 
 #else /*no LODEPNG_COMPILE_ZLIB*/
 
@@ -7055,6 +7251,8 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "zlib stream requires a preset dictionary (FDICT) but none was provided";
+    case 125: return "the provided preset dictionary does not match the zlib stream's DICTID";
   }
   return "unknown error code";
 }
