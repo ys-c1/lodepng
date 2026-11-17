@@ -5247,6 +5247,91 @@ static unsigned readChunk_sBIT(LodePNGInfo* info, const unsigned char* data, siz
 
   return 0; /* OK */
 }
+
+/*
+sBIT sample scaling extension.
+
+These two functions are an opt-in extension: they are not declared in
+lodepng.h, so the default decoding and encoding behavior is completely
+unchanged (in particular the decoder never alters pixel values based on
+sBIT). Users who need them can declare the prototypes themselves:
+
+  unsigned lodepng_sbit_effective(const LodePNGInfo* info, const LodePNGColorMode* mode, unsigned channel);
+  unsigned lodepng_sbit_scale_to_full_range(unsigned char* image, unsigned w, unsigned h,
+                                            const LodePNGColorMode* mode, const LodePNGInfo* info);
+
+Use case: a scanner (or similar device) stores samples with, e.g., only 10
+significant bits in a 16-bit PNG, leaving the values in the low range
+[0, 1023] instead of the full [0, 65535] range. After decoding (without
+color conversion, so the buffer color mode matches the PNG color mode the
+sBIT values belong to), lodepng_sbit_scale_to_full_range rescales every
+sample from the significant-bits range to the full range of the buffer bit
+depth with round-to-nearest: out = round(v * max_out / max_in).
+*/
+
+/*
+Returns the effective significant bits of the given channel of a buffer with
+the given color mode: the value from the sBIT chunk if one was present,
+otherwise the full bit depth of the color mode (inferred when the chunk is
+absent). For palette images the sBIT values apply to the palette entries,
+not to the pixel indices, so the full bit depth is returned here.
+*/
+unsigned lodepng_sbit_effective(const LodePNGInfo* info, const LodePNGColorMode* mode, unsigned channel) {
+  if(!info->sbit_defined) return mode->bitdepth;
+  switch(mode->colortype) {
+    case LCT_GREY: return info->sbit_r;
+    case LCT_RGB: return channel == 0 ? info->sbit_r : (channel == 1 ? info->sbit_g : info->sbit_b);
+    case LCT_GREY_ALPHA: return channel == 0 ? info->sbit_r : info->sbit_a;
+    case LCT_RGBA: return channel == 0 ? info->sbit_r : (channel == 1 ? info->sbit_g : (channel == 2 ? info->sbit_b : info->sbit_a));
+    default: return mode->bitdepth; /*LCT_PALETTE and LCT_MAX_OCTET_VALUE: no per-pixel scaling*/
+  }
+}
+
+/*
+Rescales the samples of an 8-bit or 16-bit image buffer in place from the
+effective significant bits (see lodepng_sbit_effective) up to the full range
+of the color mode's bit depth. Channels whose effective significant bits
+equal the bit depth (including all channels when no sBIT chunk was present)
+are left untouched. Returns error 115 if a significant bits value is zero or
+exceeds the bit depth, and error 124 for color modes this cannot handle
+(palette, or bit depth below 8).
+*/
+unsigned lodepng_sbit_scale_to_full_range(unsigned char* image, unsigned w, unsigned h,
+                                          const LodePNGColorMode* mode, const LodePNGInfo* info) {
+  unsigned bitdepth = mode->bitdepth;
+  unsigned channels, c, maxv;
+  unsigned sbit[4];
+  size_t i, num_samples;
+  if(mode->colortype == LCT_PALETTE || (bitdepth != 8 && bitdepth != 16)) return 124;
+  channels = lodepng_get_channels(mode);
+  maxv = (1u << bitdepth) - 1u;
+  for(c = 0; c != channels; ++c) {
+    sbit[c] = lodepng_sbit_effective(info, mode, c);
+    if(sbit[c] == 0 || sbit[c] > bitdepth) return 115; /*significant bits may not exceed the bit depth*/
+  }
+  num_samples = (size_t)w * (size_t)h * channels;
+  if(bitdepth == 8) {
+    for(i = 0; i != num_samples; ++i) {
+      unsigned s = sbit[i % channels];
+      unsigned smax;
+      if(s == 8) continue;
+      smax = (1u << s) - 1u;
+      image[i] = (unsigned char)(((size_t)image[i] * maxv + (smax >> 1)) / smax);
+    }
+  } else { /*16-bit samples are stored big endian, MSB first*/
+    for(i = 0; i != num_samples; ++i) {
+      unsigned s = sbit[i % channels];
+      unsigned smax, v;
+      if(s == 16) continue;
+      smax = (1u << s) - 1u;
+      v = 256u * image[2 * i] + image[2 * i + 1];
+      v = (unsigned)(((size_t)v * maxv + (smax >> 1)) / smax);
+      image[2 * i] = (unsigned char)((v >> 8) & 255u);
+      image[2 * i + 1] = (unsigned char)(v & 255u);
+    }
+  }
+  return 0; /* OK */
+}
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 
 unsigned lodepng_inspect_chunk(LodePNGState* state, size_t pos,
@@ -7055,6 +7140,7 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "sBIT sample scaling not supported for this color mode or bit depth";
   }
   return "unknown error code";
 }
