@@ -1092,9 +1092,15 @@ static unsigned getTreeInflateFixed(HuffmanTree* tree_ll, HuffmanTree* tree_d) {
   return generateFixedDistanceTree(tree_d);
 }
 
-/*get the tree of a deflated block with dynamic tree, the tree itself is also Huffman compressed with a known tree*/
+/*get the tree of a deflated block with dynamic tree, the tree itself is also Huffman compressed with a known tree.
+If save_ll/save_d are not null, the code lengths of the lit/len and distance trees are copied there
+(save_ll/save_d must have room for NUM_DEFLATE_CODE_SYMBOLS / NUM_DISTANCE_SYMBOLS bytes) and the
+amounts of used codes are stored in save_hlit/save_hdist. This allows reconstructing the trees later,
+which is used by the resumable decoder to checkpoint inside a dynamic block.*/
 static unsigned getTreeInflateDynamic(HuffmanTree* tree_ll, HuffmanTree* tree_d,
-                                      LodePNGBitReader* reader) {
+                                      LodePNGBitReader* reader,
+                                      unsigned char* save_ll, unsigned char* save_d,
+                                      unsigned* save_hlit, unsigned* save_hdist) {
   /*make sure that length values that aren't filled in will be 0, or a wrong tree will be generated*/
   unsigned error = 0;
   unsigned n, HLIT, HDIST, HCLEN, i;
@@ -1214,6 +1220,15 @@ static unsigned getTreeInflateDynamic(HuffmanTree* tree_ll, HuffmanTree* tree_d,
     error = HuffmanTree_makeFromLengths(tree_ll, bitlen_ll, NUM_DEFLATE_CODE_SYMBOLS, 15);
     if(error) break;
     error = HuffmanTree_makeFromLengths(tree_d, bitlen_d, NUM_DISTANCE_SYMBOLS, 15);
+    if(error) break;
+
+    /*optionally save the code lengths so the trees can be reconstructed for a resume checkpoint*/
+    if(save_ll && save_d && save_hlit && save_hdist) {
+      for(i = 0; i != HLIT; ++i) save_ll[i] = (unsigned char)bitlen_ll[i];
+      for(i = 0; i != HDIST; ++i) save_d[i] = (unsigned char)bitlen_d[i];
+      *save_hlit = HLIT;
+      *save_hdist = HDIST;
+    }
 
     break; /*end of error-while*/
   }
@@ -1226,23 +1241,26 @@ static unsigned getTreeInflateDynamic(HuffmanTree* tree_ll, HuffmanTree* tree_d,
   return error;
 }
 
-/*inflate a block with dynamic of fixed Huffman tree. btype must be 1 or 2.*/
-static unsigned inflateHuffmanBlock(ucvector* out, LodePNGBitReader* reader,
-                                    unsigned btype, size_t max_output_size) {
+/*
+Decodes the huffman encoded symbols of one deflate block (the part after the block header and,
+for dynamic blocks, after the code length descriptions) until the end-of-block code.
+tree_ll and tree_d must be the initialized literal/length and distance trees.
+If pause_target is nonzero, this function stops at the first symbol boundary where
+out->size >= pause_target, sets *paused to 1 and returns 0: the bit reader is then exactly at a
+symbol boundary and decoding of this block can be resumed later with the same trees.
+This is shared by inflateHuffmanBlock (regular one-shot inflate) and by the resumable inflate
+used for decode state snapshots.
+*/
+static unsigned inflateHuffmanSymbols(ucvector* out, LodePNGBitReader* reader,
+                                      const HuffmanTree* tree_ll, const HuffmanTree* tree_d,
+                                      size_t max_output_size, size_t pause_target, int* paused) {
   unsigned error = 0;
-  HuffmanTree tree_ll; /*the huffman tree for literal and length codes*/
-  HuffmanTree tree_d; /*the huffman tree for distance codes*/
   const size_t reserved_size = 260; /* must be at least 258 for max length, and a few extra for adding a few extra literals */
   int done = 0;
 
+  if(paused) *paused = 0;
+
   if(lodepng_addofls(out->size, reserved_size) || !ucvector_reserve(out, out->size + reserved_size)) return 83; /*alloc fail*/
-
-  HuffmanTree_init(&tree_ll);
-  HuffmanTree_init(&tree_d);
-
-  if(btype == 1) error = getTreeInflateFixed(&tree_ll, &tree_d);
-  else /*if(btype == 2)*/ error = getTreeInflateDynamic(&tree_ll, &tree_d, reader);
-
 
   while(!error && !done) /*decode all symbols until end reached, breaks at end code*/ {
     /*code_ll is literal, length or end code*/
@@ -1250,11 +1268,11 @@ static unsigned inflateHuffmanBlock(ucvector* out, LodePNGBitReader* reader,
     /* ensure enough bits for 2 huffman code reads (15 bits each): if the first is a literal, a second literal is read at once. This
     appears to be slightly faster, than ensuring 20 bits here for 1 huffman symbol and the potential 5 extra bits for the length symbol.*/
     ensureBits32(reader, 30);
-    code_ll = huffmanDecodeSymbol(reader, &tree_ll);
+    code_ll = huffmanDecodeSymbol(reader, tree_ll);
     if(code_ll <= 255) {
       /*slightly faster code path if multiple literals in a row*/
       out->data[out->size++] = (unsigned char)code_ll;
-      code_ll = huffmanDecodeSymbol(reader, &tree_ll);
+      code_ll = huffmanDecodeSymbol(reader, tree_ll);
     }
     if(code_ll <= 255) /*literal symbol*/ {
       out->data[out->size++] = (unsigned char)code_ll;
@@ -1276,7 +1294,7 @@ static unsigned inflateHuffmanBlock(ucvector* out, LodePNGBitReader* reader,
 
       /*part 3: get distance code*/
       ensureBits32(reader, 28); /* up to 15 for the huffman symbol, up to 13 for the extra bits */
-      code_d = huffmanDecodeSymbol(reader, &tree_d);
+      code_d = huffmanDecodeSymbol(reader, tree_d);
       if(code_d > 29) {
         if(code_d <= 31) {
           ERROR_BREAK(18); /*error: invalid distance code (30-31 are never used)*/
@@ -1327,7 +1345,30 @@ static unsigned inflateHuffmanBlock(ucvector* out, LodePNGBitReader* reader,
     if(max_output_size && out->size > max_output_size) {
       ERROR_BREAK(109); /*error, larger than max size*/
     }
+    if(!done && pause_target && out->size >= pause_target) {
+      /*pause requested and target reached: stop at this symbol boundary*/
+      if(paused) *paused = 1;
+      break;
+    }
   }
+
+  return error;
+}
+
+/*inflate a block with dynamic of fixed Huffman tree. btype must be 1 or 2.*/
+static unsigned inflateHuffmanBlock(ucvector* out, LodePNGBitReader* reader,
+                                    unsigned btype, size_t max_output_size) {
+  unsigned error = 0;
+  HuffmanTree tree_ll; /*the huffman tree for literal and length codes*/
+  HuffmanTree tree_d; /*the huffman tree for distance codes*/
+
+  HuffmanTree_init(&tree_ll);
+  HuffmanTree_init(&tree_d);
+
+  if(btype == 1) error = getTreeInflateFixed(&tree_ll, &tree_d);
+  else /*if(btype == 2)*/ error = getTreeInflateDynamic(&tree_ll, &tree_d, reader, 0, 0, 0, 0);
+
+  if(!error) error = inflateHuffmanSymbols(out, reader, &tree_ll, &tree_d, max_output_size, 0, 0);
 
   HuffmanTree_cleanup(&tree_ll);
   HuffmanTree_cleanup(&tree_d);
@@ -5637,6 +5678,994 @@ void lodepng_decoder_settings_init(LodePNGDecoderSettings* settings) {
   lodepng_decompress_settings_init(&settings->zlibsettings);
 }
 
+/* ////////////////////////////////////////////////////////////////////////// */
+/* / Resumable PNG decoder with decode state snapshots                      / */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*
+This section adds resumable decoding on top of the regular decoder: a decode
+session can pause at row checkpoints, serialize its state (completed row
+number, unfilter state = previous unfiltered scanline, and zlib/inflate
+position = bit position in the deflate stream + mid-block huffman code lengths
++ the deflate history window) into a small byte buffer, and later be restored
+from that buffer (also in another process) to continue decoding where it left
+off. The checkpoint interval (in rows) and the amount of deflate history kept
+per snapshot (which determines the snapshot size) are configurable. The final
+image is bit identical to a one-shot lodepng_decode32 of the same PNG.
+
+The snapshot does not contain the already decoded output rows: those are the
+user's partial output (available through lodepng_session_partial) and must be
+given back to lodepng_session_restore together with the snapshot and the
+original PNG data.
+
+Current format limits (error 126 is returned when exceeded): the raw inflated
+image data, the amount of inflated bytes at a checkpoint and the bit position
+in the deflate stream must each fit in 32 bits (this allows images with
+multiple gigabytes of raw data).
+
+The functions are defined here but intentionally not declared in lodepng.h;
+declare them in user code as follows if needed:
+
+typedef struct LodePNGDecodeSession LodePNGDecodeSession;
+LodePNGDecodeSession* lodepng_session_begin(const unsigned char* in, size_t insize,
+                                            unsigned interval_rows, size_t window_size,
+                                            unsigned* error);
+unsigned lodepng_session_step(LodePNGDecodeSession* session);
+int lodepng_session_is_paused(const LodePNGDecodeSession* session);
+int lodepng_session_is_finished(const LodePNGDecodeSession* session);
+unsigned lodepng_session_snapshot(const LodePNGDecodeSession* session,
+                                  unsigned char** out, size_t* outsize);
+LodePNGDecodeSession* lodepng_session_restore(const unsigned char* in, size_t insize,
+                                              const unsigned char* snapshot, size_t snapshot_size,
+                                              const unsigned char* partial, size_t partial_size,
+                                              unsigned* error);
+const unsigned char* lodepng_session_partial(const LodePNGDecodeSession* session, size_t* size);
+unsigned lodepng_session_output(LodePNGDecodeSession* session,
+                                unsigned char** out, unsigned* w, unsigned* h);
+void lodepng_session_destroy(LodePNGDecodeSession* session);
+*/
+
+#define LODEPNG_RESUME_WINDOW_MAX 32768u /*deflate window size*/
+#define LODEPNG_RESUME_WINDOW_MIN 512u   /*must be > 258 (max pause overshoot past a row boundary)*/
+#define LODEPNG_RESUME_VERSION 1u
+#define LODEPNG_RESUME_HEADER_SIZE 104u
+
+/*inflate checkpoint: everything needed to resume inflate at a symbol (or stored-block) boundary*/
+typedef struct LodePNGInflateCheckpoint {
+  size_t bp;        /*bit position in the deflate stream*/
+  size_t produced;  /*total inflated bytes produced so far*/
+  unsigned btype;   /*0: at a block boundary, 1: inside fixed huffman block,
+                      2: inside dynamic huffman block, 3: inside uncompressed block*/
+  unsigned bfinal;  /*for btype 1, 2 and 3: the BFINAL bit of the block being resumed*/
+  unsigned hlit;    /*for btype 2: amount of lit/len code lengths*/
+  unsigned hdist;   /*for btype 2: amount of distance code lengths*/
+  unsigned nc_remaining; /*for btype 3: remaining bytes of the uncompressed block*/
+  unsigned char bitlen_ll[NUM_DEFLATE_CODE_SYMBOLS]; /*for btype 2: lit/len code lengths*/
+  unsigned char bitlen_d[NUM_DISTANCE_SYMBOLS];      /*for btype 2: distance code lengths*/
+} LodePNGInflateCheckpoint;
+
+typedef struct LodePNGDecodeSession LodePNGDecodeSession;
+
+struct LodePNGDecodeSession {
+  /*PNG info*/
+  LodePNGInfo info_png; /*parsed PNG info (color type, palette, ...)*/
+  unsigned w, h;
+  unsigned bpp;        /*bits per pixel of the PNG color mode*/
+  unsigned bytewidth;  /*bytes per pixel for unfiltering*/
+  unsigned interlace;  /*0 or 1 (Adam7)*/
+  /*IDAT data (zlib stream)*/
+  unsigned char* idat;
+  size_t idatsize;
+  unsigned idat_crc;   /*crc32 of the idat data, binds a snapshot to its PNG*/
+  /*inflate state*/
+  unsigned char* raw;  /*inflated (still filtered) data produced so far (or the window after restore)*/
+  size_t raw_size;
+  size_t raw_alloc;
+  size_t raw_base;     /*logical stream offset of raw[0] (0 normally, produced-window after restore)*/
+  size_t produced;     /*total logical inflated bytes so far*/
+  size_t expected;     /*expected total raw size*/
+  LodePNGInflateCheckpoint cp;
+  int cp_valid;        /*a checkpoint was taken and can be snapshotted/continued from*/
+  unsigned adler;      /*running adler32 of all produced bytes*/
+  /*unfilter state*/
+  unsigned num_passes; /*1 when not interlaced, 7 for Adam7*/
+  unsigned passw[7], passh[7];
+  size_t filter_passstart[8], padded_passstart[8], passstart[8];
+  size_t linebytes[7]; /*bytes per scanline (without filter byte) per pass*/
+  size_t max_linebytes;
+  unsigned pass;       /*current pass*/
+  unsigned row;        /*next row to unfilter in current pass*/
+  size_t rows_done;    /*total unfiltered rows over all passes*/
+  size_t total_rows;
+  unsigned char* prevline; /*previous unfiltered scanline of the current pass*/
+  int have_prevline;
+  /*unfiltered output in padded per-pass layout (the "partial" output buffer)*/
+  unsigned char* unf;
+  size_t unf_size;
+  /*final RGBA8 output, valid when finished*/
+  unsigned char* out;
+  size_t out_size;
+  /*configuration*/
+  unsigned interval;   /*checkpoint interval in rows*/
+  size_t window_size;  /*deflate history bytes stored per snapshot*/
+  size_t next_target;  /*logical produced count of next pause, 0 = run to completion*/
+  /*status*/
+  int paused;
+  int finished;
+  unsigned error;
+};
+
+/*forward declarations for functions used before their definition below*/
+void lodepng_session_destroy(LodePNGDecodeSession* session);
+static unsigned lodepng_session_finish(LodePNGDecodeSession* s);
+
+static void lodepng_snapshot_put32(unsigned char* p, size_t value) {
+  p[0] = (unsigned char)(value & 255u);
+  p[1] = (unsigned char)((value >> 8u) & 255u);
+  p[2] = (unsigned char)((value >> 16u) & 255u);
+  p[3] = (unsigned char)((value >> 24u) & 255u);
+}
+static size_t lodepng_snapshot_get32(const unsigned char* p) {
+  return (size_t)((unsigned long)p[0] | ((unsigned long)p[1] << 8u) |
+         ((unsigned long)p[2] << 16u) | ((unsigned long)p[3] << 24u));
+}
+
+/*rebuild the huffman trees of a dynamic block from a checkpoint's saved code lengths*/
+static unsigned lodepng_make_trees_from_checkpoint(HuffmanTree* tree_ll, HuffmanTree* tree_d,
+                                                   const LodePNGInflateCheckpoint* cp) {
+  unsigned error;
+  unsigned bitlen_ll[NUM_DEFLATE_CODE_SYMBOLS];
+  unsigned bitlen_d[NUM_DISTANCE_SYMBOLS];
+  unsigned i;
+  for(i = 0; i != cp->hlit; ++i) bitlen_ll[i] = cp->bitlen_ll[i];
+  for(i = 0; i != cp->hdist; ++i) bitlen_d[i] = cp->bitlen_d[i];
+  error = HuffmanTree_makeFromLengths(tree_ll, bitlen_ll, cp->hlit, 15);
+  if(!error) error = HuffmanTree_makeFromLengths(tree_d, bitlen_d, cp->hdist, 15);
+  return error;
+}
+
+/*
+Inflate one huffman block for the resumable decoder.
+If resume is 0, the block header was just read and btype (1 or 2) selects the tree type; for a
+dynamic block the code lengths are stored into cp so a later checkpoint can resume mid-block.
+If resume is 1, the trees are rebuilt from cp (fixed tree regenerated, dynamic tree from the
+saved code lengths) and decoding continues at the reader's current bit position.
+pause_target: if nonzero, pause (set *paused to 1) at the first symbol boundary where
+out->size >= pause_target.
+*/
+static unsigned lodepng_inflate_huffman_block_resumable(ucvector* out, LodePNGBitReader* reader,
+                                                        unsigned btype, size_t max_output_size,
+                                                        size_t pause_target, int* paused,
+                                                        LodePNGInflateCheckpoint* cp, int resume) {
+  unsigned error = 0;
+  HuffmanTree tree_ll;
+  HuffmanTree tree_d;
+
+  HuffmanTree_init(&tree_ll);
+  HuffmanTree_init(&tree_d);
+
+  if(resume) {
+    if(cp->btype == 1) error = getTreeInflateFixed(&tree_ll, &tree_d);
+    else error = lodepng_make_trees_from_checkpoint(&tree_ll, &tree_d, cp);
+  } else {
+    if(btype == 1) error = getTreeInflateFixed(&tree_ll, &tree_d);
+    else /*if(btype == 2)*/ error = getTreeInflateDynamic(&tree_ll, &tree_d, reader,
+                                                          cp->bitlen_ll, cp->bitlen_d,
+                                                          &cp->hlit, &cp->hdist);
+  }
+
+  if(!error) error = inflateHuffmanSymbols(out, reader, &tree_ll, &tree_d,
+                                           max_output_size, pause_target, paused);
+
+  if(*paused) cp->btype = resume ? cp->btype : btype;
+
+  HuffmanTree_cleanup(&tree_ll);
+  HuffmanTree_cleanup(&tree_d);
+
+  return error;
+}
+
+/*
+Inflate (part of) an uncompressed deflate block for the resumable decoder. Unlike the one-shot
+inflateNoCompression this can pause mid-block: it copies at most up to pause_target and remembers
+the remaining LEN in cp so the block can be resumed. pause_target is compared against out->size.
+*/
+static unsigned lodepng_inflate_no_compression_partial(ucvector* out, LodePNGBitReader* reader,
+                                                       size_t pause_target, int* paused,
+                                                       LodePNGInflateCheckpoint* cp, int resume) {
+  size_t bytepos;
+  size_t size = reader->size;
+  unsigned LEN = 0, NLEN = 0;
+  size_t chunk;
+
+  if(resume) {
+    LEN = cp->nc_remaining;
+    bytepos = reader->bp >> 3u; /*the bit pointer is byte aligned here*/
+  } else {
+    /*go to first boundary of byte*/
+    bytepos = (reader->bp + 7u) >> 3u;
+
+    /*read LEN (2 bytes) and NLEN (2 bytes)*/
+    if(bytepos + 4 >= size) return 52; /*error, bit pointer will jump past memory*/
+    LEN = (unsigned)reader->data[bytepos] + ((unsigned)reader->data[bytepos + 1] << 8u); bytepos += 2;
+    NLEN = (unsigned)reader->data[bytepos] + ((unsigned)reader->data[bytepos + 1] << 8u); bytepos += 2;
+
+    /*check if 16-bit NLEN is really the one's complement of LEN*/
+    if(LEN + NLEN != 65535) return 21; /*error: NLEN is not one's complement of LEN*/
+  }
+
+  if(bytepos + LEN > size) return 23; /*error: reading outside of in buffer*/
+
+  chunk = LEN;
+  if(pause_target && out->size + chunk > pause_target) chunk = pause_target - out->size;
+
+  if(lodepng_addofls(out->size, chunk) || !ucvector_resize(out, out->size + chunk)) return 83; /*alloc fail*/
+  if(chunk) lodepng_memcpy(out->data + out->size - chunk, reader->data + bytepos, chunk);
+  bytepos += chunk;
+  reader->bp = bytepos << 3u;
+
+  if(chunk < LEN) {
+    cp->btype = 3;
+    cp->nc_remaining = (unsigned)(LEN - chunk);
+    *paused = 1;
+  }
+
+  return 0;
+}
+
+/*
+Resumable inflate driver. Inflates from "in" (the deflate stream, i.e. the zlib data without the
+2-byte zlib header) into out, until the end of the stream or until the logical produced amount
+(outbase + out->size) reaches pause_target (if nonzero). outbase is the logical stream offset of
+out->data[0]: nonzero when "out" starts with a restored history window instead of the full output.
+If resume is nonzero, decoding continues from checkpoint cp (bit position and, if mid-block, the
+block state). On a pause, cp is updated so that it fully describes the inflate position.
+Returns 0 on success (also when paused, check *paused), or a lodepng error code.
+*/
+static unsigned lodepng_inflate_resumable(ucvector* out, size_t outbase,
+                                          const unsigned char* in, size_t insize,
+                                          size_t max_output_size, size_t pause_target,
+                                          int* paused, LodePNGInflateCheckpoint* cp, int resume) {
+  unsigned BFINAL = 0;
+  LodePNGBitReader reader;
+  unsigned error = LodePNGBitReader_init(&reader, in, insize);
+  size_t adj_target = (pause_target && pause_target > outbase) ? pause_target - outbase : 0;
+
+  if(error) return error;
+  *paused = 0;
+  if(resume) reader.bp = cp->bp;
+
+  /*if the checkpoint is inside a block, first finish that block*/
+  if(resume && cp->btype == 3) {
+    error = lodepng_inflate_no_compression_partial(out, &reader, adj_target, paused, cp, 1);
+    if(error || *paused) goto done;
+    BFINAL = cp->bfinal;
+  } else if(resume && cp->btype != 0) {
+    error = lodepng_inflate_huffman_block_resumable(out, &reader, cp->btype, max_output_size,
+                                                    adj_target, paused, cp, 1);
+    if(error || *paused) goto done;
+    BFINAL = cp->bfinal;
+  }
+
+  while(!BFINAL) {
+    unsigned BTYPE;
+    /*pause at a block boundary if the target was reached*/
+    if(adj_target && out->size >= adj_target) {
+      cp->btype = 0;
+      *paused = 1;
+      break;
+    }
+    if(reader.bitsize - reader.bp < 3) { error = 52; break; } /*error, bit pointer will jump past memory*/
+    ensureBits9(&reader, 3);
+    BFINAL = readBits(&reader, 1);
+    BTYPE = readBits(&reader, 2);
+    cp->bfinal = BFINAL; /*remembered in case a pause happens inside this block*/
+
+    if(BTYPE == 3) { error = 20; break; } /*error: invalid BTYPE*/
+    else if(BTYPE == 0) error = lodepng_inflate_no_compression_partial(out, &reader, adj_target, paused, cp, 0);
+    else error = lodepng_inflate_huffman_block_resumable(out, &reader, BTYPE, max_output_size,
+                                                         adj_target, paused, cp, 0);
+    if(!error && max_output_size && out->size > max_output_size) error = 109;
+    if(error || *paused) break;
+  }
+
+done:
+  if(*paused) {
+    cp->bp = reader.bp;
+    cp->produced = outbase + out->size;
+  }
+  return error;
+}
+
+/*schedule the next pause target from rows_done + interval; sets next_target to 0 to run to completion*/
+static void lodepng_session_schedule_next(LodePNGDecodeSession* s) {
+  size_t target_rows = s->rows_done + s->interval;
+  unsigned i = 0;
+  size_t r;
+  if(s->interval == 0 || target_rows >= s->total_rows) {
+    s->next_target = 0;
+    return;
+  }
+  /*locate the pass and row-in-pass of the global row with index target_rows*/
+  r = target_rows;
+  while(i < s->num_passes && (s->passh[i] == 0 || r >= s->passh[i])) {
+    r -= s->passh[i];
+    ++i;
+  }
+  /*the pause target is the raw byte offset where that row starts*/
+  s->next_target = s->filter_passstart[i] + r * (s->linebytes[i] + 1u);
+}
+
+/*unfilter all rows whose filtered data is fully available in the produced bytes*/
+static unsigned lodepng_session_unfilter_available(LodePNGDecodeSession* s) {
+  while(s->pass < s->num_passes) {
+    unsigned i = s->pass;
+    size_t linebytes, rowstart, idx;
+    unsigned char filterType;
+    unsigned char* recon;
+    unsigned error;
+    if(s->passw[i] == 0 || s->passh[i] == 0 || s->row >= s->passh[i]) {
+      /*empty or finished pass: go to the next one, the previous-scanline state resets*/
+      s->pass++;
+      s->row = 0;
+      s->have_prevline = 0;
+      continue;
+    }
+    linebytes = s->linebytes[i];
+    rowstart = s->filter_passstart[i] + s->row * (linebytes + 1u);
+    if(rowstart + linebytes + 1u > s->produced) break; /*this row is not fully available yet*/
+    idx = rowstart - s->raw_base;
+    filterType = s->raw[idx];
+    recon = s->unf + s->padded_passstart[i] + s->row * linebytes;
+    error = unfilterScanline(recon, s->raw + idx + 1, s->have_prevline ? s->prevline : 0,
+                             s->bytewidth, filterType, linebytes);
+    if(error) return error;
+    lodepng_memcpy(s->prevline, recon, linebytes);
+    s->have_prevline = 1;
+    s->row++;
+    s->rows_done++;
+  }
+  return 0;
+}
+
+/*parse the PNG: header, IDAT data, palette and transparency (everything the decode needs)*/
+static unsigned lodepng_session_parse(LodePNGDecodeSession* s, const unsigned char* in, size_t insize) {
+  LodePNGState state;
+  unsigned error;
+  const unsigned char* chunk;
+  unsigned char IEND = 0;
+  size_t idatsize = 0;
+  unsigned unknown = 0;
+  LodePNGColorMode rawmode;
+
+  lodepng_state_init(&state);
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+  state.decoder.read_text_chunks = 0;
+  state.decoder.remember_unknown_chunks = 0;
+#endif
+
+  error = lodepng_inspect(&s->w, &s->h, &state, in, insize);
+  if(error) {
+    lodepng_state_cleanup(&state);
+    return error;
+  }
+
+  /*the session always outputs 32-bit RGBA, check for overflow like decodeGeneric does*/
+  lodepng_color_mode_init(&rawmode);
+  if(lodepng_pixel_overflow(s->w, s->h, &state.info_png.color, &rawmode)) {
+    lodepng_state_cleanup(&state);
+    return 92;
+  }
+
+  s->idat = (unsigned char*)lodepng_malloc(insize ? insize : 1);
+  if(!s->idat) {
+    lodepng_state_cleanup(&state);
+    return 83; /*alloc fail*/
+  }
+
+  chunk = &in[33]; /*first byte of the first chunk after the header*/
+
+  while(!IEND && !error) {
+    unsigned chunkLength;
+    const unsigned char* data;
+    size_t pos = (size_t)(chunk - in);
+
+    /*error: next chunk out of bounds of the in buffer*/
+    if(chunk < in || pos + 12 > insize) {
+      error = 30;
+      break;
+    }
+
+    /*length of the data of the chunk, excluding the 12 bytes for length, chunk type and CRC*/
+    chunkLength = lodepng_chunk_length(chunk);
+    /*error: chunk length larger than the max PNG chunk size*/
+    if(chunkLength > 2147483647) {
+      error = 63;
+      break;
+    }
+
+    if(pos + (size_t)chunkLength + 12 > insize || pos + (size_t)chunkLength + 12 < pos) {
+      error = 64; /*error: size of the in buffer too small to contain next chunk (or int overflow)*/
+      break;
+    }
+
+    data = lodepng_chunk_data_const(chunk);
+
+    unknown = 0;
+
+    if(lodepng_chunk_type_equals(chunk, "IDAT")) {
+      size_t newsize;
+      if(lodepng_addofl(idatsize, chunkLength, &newsize)) { error = 95; break; }
+      if(newsize > insize) { error = 95; break; }
+      lodepng_memcpy(s->idat + idatsize, data, chunkLength);
+      idatsize += chunkLength;
+    } else if(lodepng_chunk_type_equals(chunk, "IEND")) {
+      IEND = 1;
+    } else if(lodepng_chunk_type_equals(chunk, "PLTE")) {
+      error = readChunk_PLTE(&state.info_png.color, data, chunkLength);
+      if(error) break;
+    } else if(lodepng_chunk_type_equals(chunk, "tRNS")) {
+      error = readChunk_tRNS(&state.info_png.color, data, chunkLength);
+      if(error) break;
+    } else /*it's not a chunk type needed by the session decoder, so ignore it: skip over the data*/ {
+      if(!lodepng_chunk_type_name_valid(chunk)) {
+        error = 121; /* invalid chunk type name */
+        break;
+      }
+      if(lodepng_chunk_reserved(chunk)) {
+        error = 122; /* invalid third lowercase character */
+        break;
+      }
+
+      /*error: unknown critical chunk (5th bit of first byte of chunk type is 0)*/
+      if(!state.decoder.ignore_critical && !lodepng_chunk_ancillary(chunk)) {
+        error = 69;
+        break;
+      }
+
+      unknown = 1;
+    }
+
+    if(!state.decoder.ignore_crc && !unknown) /*check CRC, only on known chunk types*/ {
+      if(lodepng_chunk_check_crc(chunk)) {
+        error = 57; /*invalid CRC*/
+        break;
+      }
+    }
+
+    if(!IEND) chunk = lodepng_chunk_next_const(chunk, in + insize);
+  }
+
+  if(!error && state.info_png.color.colortype == LCT_PALETTE && !state.info_png.color.palette) {
+    error = 106; /* error: PNG file must have PLTE chunk if color type is palette */
+  }
+
+  if(!error) {
+    s->idatsize = idatsize;
+    s->idat_crc = lodepng_crc32(s->idat, idatsize);
+    error = lodepng_info_copy(&s->info_png, &state.info_png);
+  }
+
+  lodepng_state_cleanup(&state);
+  return error;
+}
+
+/*compute derived values and allocate buffers after parsing*/
+static unsigned lodepng_session_setup(LodePNGDecodeSession* s, unsigned interval, size_t window_size) {
+  unsigned i;
+  unsigned CM, CINFO, FDICT;
+
+  s->bpp = lodepng_get_bpp(&s->info_png.color);
+  if(s->bpp == 0) return 31; /*error: invalid color type*/
+  s->interlace = s->info_png.interlace_method;
+  s->bytewidth = (s->bpp + 7u) / 8u;
+  s->interval = interval;
+  s->window_size = window_size;
+
+  if(s->interlace == 0) {
+    s->num_passes = 1;
+    s->passw[0] = s->w;
+    s->passh[0] = s->h;
+    s->filter_passstart[0] = 0;
+    s->padded_passstart[0] = 0;
+    s->passstart[0] = 0;
+    s->filter_passstart[1] = lodepng_get_raw_size_idat(s->w, s->h, s->bpp);
+    s->padded_passstart[1] = (size_t)s->h * (lodepng_get_raw_size_idat(s->w, 1, s->bpp) - 1u);
+    s->passstart[1] = s->padded_passstart[1];
+  } else {
+    s->num_passes = 7;
+    Adam7_getpassvalues(s->passw, s->passh, s->filter_passstart, s->padded_passstart,
+                        s->passstart, s->w, s->h, s->bpp);
+  }
+
+  s->expected = s->filter_passstart[s->num_passes];
+  s->unf_size = s->padded_passstart[s->num_passes];
+  s->total_rows = 0;
+  s->max_linebytes = 0;
+  for(i = 0; i != s->num_passes; ++i) {
+    s->linebytes[i] = (s->passw[i] && s->passh[i]) ? lodepng_get_raw_size_idat(s->passw[i], 1, s->bpp) - 1u : 0;
+    s->total_rows += s->passh[i];
+    if(s->linebytes[i] > s->max_linebytes) s->max_linebytes = s->linebytes[i];
+  }
+
+  /*validate the zlib header of the IDAT data, like lodepng_zlib_decompressv does*/
+  if(s->idatsize < 6) return 53; /*error, size of zlib data too small*/
+  if((s->idat[0] * 256 + s->idat[1]) % 31 != 0) return 24; /*error: FCHECK check failed*/
+  CM = s->idat[0] & 15;
+  CINFO = (s->idat[0] >> 4) & 15;
+  FDICT = (s->idat[1] >> 5) & 1;
+  if(CM != 8 || CINFO > 7) return 25; /*error: only compression method 8 is supported by the PNG spec*/
+  if(FDICT != 0) return 26; /*error: the PNG spec does not allow a preset dictionary*/
+
+  s->prevline = (unsigned char*)lodepng_malloc(s->max_linebytes ? s->max_linebytes : 1);
+  if(!s->prevline) return 83; /*alloc fail*/
+  s->unf = (unsigned char*)lodepng_malloc(s->unf_size ? s->unf_size : 1);
+  if(!s->unf) return 83; /*alloc fail*/
+  lodepng_memset(s->unf, 0, s->unf_size);
+
+  s->adler = 1; /*initial adler32 value*/
+  lodepng_session_schedule_next(s);
+  return 0;
+}
+
+LodePNGDecodeSession* lodepng_session_begin(const unsigned char* in, size_t insize,
+                                            unsigned interval_rows, size_t window_size,
+                                            unsigned* error) {
+  LodePNGDecodeSession* s;
+  unsigned err = 0;
+
+  if(interval_rows == 0) interval_rows = 64; /*default checkpoint interval*/
+  if(window_size == 0) window_size = LODEPNG_RESUME_WINDOW_MAX; /*default: full deflate window*/
+  if(window_size < LODEPNG_RESUME_WINDOW_MIN || window_size > LODEPNG_RESUME_WINDOW_MAX) {
+    if(error) *error = 126; /*invalid resume parameter*/
+    return 0;
+  }
+
+  s = (LodePNGDecodeSession*)lodepng_malloc(sizeof(LodePNGDecodeSession));
+  if(!s) {
+    if(error) *error = 83; /*alloc fail*/
+    return 0;
+  }
+  lodepng_memset(s, 0, sizeof(*s));
+  lodepng_info_init(&s->info_png);
+
+  err = lodepng_session_parse(s, in, insize);
+  if(!err) err = lodepng_session_setup(s, interval_rows, window_size);
+
+  if(err) {
+    lodepng_session_destroy(s);
+    if(error) *error = err;
+    return 0;
+  }
+  if(error) *error = 0;
+  return s;
+}
+
+/*
+Runs the decode until the next checkpoint or until completion. Returns 0 on success (then
+lodepng_session_is_paused tells whether a checkpoint was reached, lodepng_session_is_finished
+whether the decode completed) or a lodepng error code.
+*/
+unsigned lodepng_session_step(LodePNGDecodeSession* s) {
+  ucvector v;
+  size_t old_produced;
+  int paused = 0;
+  unsigned error;
+
+  if(!s) return 126;
+  if(s->error) return s->error;
+  if(s->finished) return 0;
+  s->paused = 0;
+
+  old_produced = s->produced;
+  v = ucvector_init(s->raw, s->raw_size);
+  v.allocsize = s->raw_alloc;
+
+  error = lodepng_inflate_resumable(&v, s->raw_base, s->idat + 2, s->idatsize - 2,
+                                    0 /*no max output size, size is verified against expected*/,
+                                    s->next_target, &paused, &s->cp, s->cp_valid);
+
+  s->raw = v.data;
+  s->raw_size = v.size;
+  s->raw_alloc = v.allocsize;
+  s->produced = s->raw_base + s->raw_size;
+
+  /*update the running adler32 with the newly produced bytes*/
+  if(s->produced > old_produced) {
+    s->adler = update_adler32(s->adler, s->raw + (old_produced - s->raw_base), s->produced - old_produced);
+  }
+
+  if(error) {
+    s->error = error;
+    return error;
+  }
+
+  if(paused) {
+    s->cp_valid = 1;
+    s->paused = 1;
+    error = lodepng_session_unfilter_available(s);
+    if(error) {
+      s->error = error;
+      return error;
+    }
+    lodepng_session_schedule_next(s);
+    return 0;
+  }
+
+  /*the deflate stream is finished*/
+  if(s->produced != s->expected) {
+    s->error = 91; /*decompressed size doesn't match prediction*/
+    return s->error;
+  }
+  /*verify the adler32 checksum from the zlib trailer, like lodepng_zlib_decompressv does*/
+  {
+    unsigned adler32_stored = lodepng_read32bitInt(&s->idat[s->idatsize - 4]);
+    if(s->adler != adler32_stored) {
+      s->error = 58; /*error, adler checksum not correct, data must be corrupted*/
+      return s->error;
+    }
+  }
+  error = lodepng_session_unfilter_available(s);
+  if(!error && s->rows_done != s->total_rows) error = 91; /*should not happen if produced == expected*/
+  if(!error) error = lodepng_session_finish(s);
+  if(error) {
+    s->error = error;
+    return error;
+  }
+  s->finished = 1;
+  return 0;
+}
+
+int lodepng_session_is_paused(const LodePNGDecodeSession* s) {
+  return s ? s->paused : 0;
+}
+
+int lodepng_session_is_finished(const LodePNGDecodeSession* s) {
+  return s ? s->finished : 0;
+}
+
+/*the partial output buffer (unfiltered rows so far, in the internal padded layout)*/
+const unsigned char* lodepng_session_partial(const LodePNGDecodeSession* s, size_t* size) {
+  if(!s) return 0;
+  if(size) *size = s->unf_size;
+  return s->unf;
+}
+
+/*assemble the final image from the unfiltered rows and convert it to 32-bit RGBA*/
+static unsigned lodepng_session_finish(LodePNGDecodeSession* s) {
+  unsigned error = 0;
+  size_t outsize = lodepng_get_raw_size(s->w, s->h, &s->info_png.color);
+  unsigned char* pngcolor = 0;
+  int pngcolor_is_unf = 0;
+  LodePNGColorMode rawmode;
+  lodepng_color_mode_init(&rawmode); /*32-bit RGBA*/
+
+  if(s->interlace == 0 && !(s->bpp < 8 && s->w * s->bpp != ((s->w * s->bpp + 7u) / 8u) * 8u)) {
+    /*the unfiltered rows already are the final image in the PNG's color model*/
+    pngcolor = s->unf;
+    pngcolor_is_unf = 1;
+  } else {
+    unsigned i;
+    pngcolor = (unsigned char*)lodepng_malloc(outsize ? outsize : 1);
+    if(!pngcolor) return 83; /*alloc fail*/
+    lodepng_memset(pngcolor, 0, outsize);
+    if(s->interlace == 0) {
+      /*remove the padding bits of the sub-byte pixels*/
+      removePaddingBits(pngcolor, s->unf, s->w * s->bpp, s->linebytes[0] * 8u, s->h);
+    } else {
+      /*remove padding bits per pass, then deinterlace*/
+      if(s->bpp < 8) {
+        for(i = 0; i != 7; ++i) {
+          removePaddingBits(&s->unf[s->passstart[i]], &s->unf[s->padded_passstart[i]],
+                            s->passw[i] * s->bpp, s->linebytes[i] * 8u, s->passh[i]);
+        }
+      }
+      Adam7_deinterlace(pngcolor, s->unf, s->w, s->h, s->bpp);
+    }
+  }
+
+  if(lodepng_color_mode_equal(&rawmode, &s->info_png.color)) {
+    /*already 32-bit RGBA, no conversion needed*/
+    s->out = pngcolor;
+    s->out_size = outsize;
+    if(pngcolor_is_unf) s->unf = 0; /*buffer moved to the output*/
+  } else {
+    s->out_size = (size_t)s->w * (size_t)s->h * 4u;
+    s->out = (unsigned char*)lodepng_malloc(s->out_size ? s->out_size : 1);
+    if(!s->out) {
+      error = 83; /*alloc fail*/
+    } else {
+      error = lodepng_convert(s->out, pngcolor, &rawmode, &s->info_png.color, s->w, s->h);
+    }
+    if(!pngcolor_is_unf) lodepng_free(pngcolor);
+  }
+
+  return error;
+}
+
+/*serialize the current checkpoint into a newly allocated buffer (free with lodepng_free)*/
+unsigned lodepng_session_snapshot(const LodePNGDecodeSession* s, unsigned char** out, size_t* outsize) {
+  size_t window_len, prevline_size, payload, total, pos;
+  unsigned char* p;
+  unsigned crc;
+
+  if(!out || !outsize) return 126;
+  *out = 0;
+  *outsize = 0;
+  if(!s) return 126;
+  if(s->error) return s->error;
+  if(!s->cp_valid || s->finished) return 126; /*no checkpoint available to snapshot*/
+
+  window_len = s->produced < s->window_size ? s->produced : s->window_size;
+  prevline_size = s->have_prevline ? s->linebytes[s->pass] : 0;
+
+  /*the 32-bit size fields of the snapshot format must be able to represent the values*/
+  if(s->expected > 0xFFFFFFFFul || s->produced > 0xFFFFFFFFul || s->cp.bp > 0xFFFFFFFFul ||
+     s->unf_size > 0xFFFFFFFFul || s->rows_done > 0xFFFFFFFFul) return 126;
+
+  payload = (s->cp.btype == 2 ? (size_t)s->cp.hlit + s->cp.hdist : 0) + window_len + prevline_size;
+  total = LODEPNG_RESUME_HEADER_SIZE + payload + 4u;
+  p = (unsigned char*)lodepng_malloc(total);
+  if(!p) return 83; /*alloc fail*/
+
+  pos = 0;
+  p[pos++] = 'L'; p[pos++] = 'P'; p[pos++] = 'R'; p[pos++] = 'S';
+  lodepng_snapshot_put32(p + 4, LODEPNG_RESUME_VERSION);
+  lodepng_snapshot_put32(p + 8, total);
+  lodepng_snapshot_put32(p + 12, s->w);
+  lodepng_snapshot_put32(p + 16, s->h);
+  p[20] = (unsigned char)s->info_png.color.colortype;
+  p[21] = (unsigned char)s->info_png.color.bitdepth;
+  p[22] = (unsigned char)s->interlace;
+  p[23] = 0; /*flags, reserved*/
+  lodepng_snapshot_put32(p + 24, s->bpp);
+  lodepng_snapshot_put32(p + 28, s->interval);
+  lodepng_snapshot_put32(p + 32, s->window_size);
+  lodepng_snapshot_put32(p + 36, window_len);
+  lodepng_snapshot_put32(p + 40, s->expected);
+  lodepng_snapshot_put32(p + 44, s->produced);
+  lodepng_snapshot_put32(p + 48, s->cp.bp);
+  lodepng_snapshot_put32(p + 52, s->cp.btype);
+  lodepng_snapshot_put32(p + 56, s->cp.btype == 2 ? s->cp.hlit : 0);
+  lodepng_snapshot_put32(p + 60, s->cp.btype == 2 ? s->cp.hdist : 0);
+  lodepng_snapshot_put32(p + 64, s->cp.btype == 3 ? s->cp.nc_remaining : 0);
+  lodepng_snapshot_put32(p + 68, s->rows_done);
+  lodepng_snapshot_put32(p + 72, s->pass);
+  lodepng_snapshot_put32(p + 76, s->row);
+  lodepng_snapshot_put32(p + 80, s->adler);
+  lodepng_snapshot_put32(p + 84, s->idat_crc);
+  lodepng_snapshot_put32(p + 88, s->unf_size);
+  lodepng_snapshot_put32(p + 92, prevline_size);
+  lodepng_snapshot_put32(p + 96, s->have_prevline ? 1u : 0u);
+  lodepng_snapshot_put32(p + 100, s->cp.btype != 0 ? s->cp.bfinal : 0);
+
+  pos = LODEPNG_RESUME_HEADER_SIZE;
+  if(s->cp.btype == 2) {
+    lodepng_memcpy(p + pos, s->cp.bitlen_ll, s->cp.hlit);
+    pos += s->cp.hlit;
+    lodepng_memcpy(p + pos, s->cp.bitlen_d, s->cp.hdist);
+    pos += s->cp.hdist;
+  }
+  if(window_len) {
+    lodepng_memcpy(p + pos, s->raw + (s->produced - window_len) - s->raw_base, window_len);
+    pos += window_len;
+  }
+  if(prevline_size) {
+    lodepng_memcpy(p + pos, s->prevline, prevline_size);
+    pos += prevline_size;
+  }
+
+  crc = lodepng_crc32(p, pos);
+  lodepng_snapshot_put32(p + pos, crc);
+  pos += 4;
+
+  *out = p;
+  *outsize = pos;
+  return 0;
+}
+
+/*restore a decode session from a snapshot, the original PNG and the partial output buffer*/
+LodePNGDecodeSession* lodepng_session_restore(const unsigned char* in, size_t insize,
+                                              const unsigned char* snap, size_t snapsize,
+                                              const unsigned char* partial, size_t partial_size,
+                                              unsigned* error) {
+  LodePNGDecodeSession* s = 0;
+  unsigned err = 124; /*default: snapshot corrupted or invalid*/
+  size_t pos, payload, window_len, prevline_size, produced, boundary, rows_check;
+  size_t expected, bp, unf_size, rows_done, window_size, interval, nc_remaining;
+  size_t btype, hlit, hdist, pass, row, adler, idat_crc, have_prevline, bfinal;
+  unsigned w, h, colortype, bitdepth, interlace, bpp;
+  unsigned i;
+
+  if(error) *error = 0;
+  if(!in || !snap || !partial) {
+    if(error) *error = 126;
+    return 0;
+  }
+
+  /*fixed-size header + crc*/
+  if(snapsize < LODEPNG_RESUME_HEADER_SIZE + 4u) goto corrupt;
+  if(snap[0] != 'L' || snap[1] != 'P' || snap[2] != 'R' || snap[3] != 'S') goto corrupt;
+  if(lodepng_snapshot_get32(snap + 4) != LODEPNG_RESUME_VERSION) goto corrupt;
+  if(lodepng_snapshot_get32(snap + 8) != snapsize) goto corrupt;
+  if(lodepng_crc32(snap, snapsize - 4) != (unsigned)lodepng_snapshot_get32(snap + snapsize - 4)) goto corrupt;
+
+  w = (unsigned)lodepng_snapshot_get32(snap + 12);
+  h = (unsigned)lodepng_snapshot_get32(snap + 16);
+  colortype = snap[20];
+  bitdepth = snap[21];
+  interlace = snap[22];
+  bpp = (unsigned)lodepng_snapshot_get32(snap + 24);
+  interval = lodepng_snapshot_get32(snap + 28);
+  window_size = lodepng_snapshot_get32(snap + 32);
+  window_len = lodepng_snapshot_get32(snap + 36);
+  expected = lodepng_snapshot_get32(snap + 40);
+  produced = lodepng_snapshot_get32(snap + 44);
+  bp = lodepng_snapshot_get32(snap + 48);
+  btype = lodepng_snapshot_get32(snap + 52);
+  hlit = lodepng_snapshot_get32(snap + 56);
+  hdist = lodepng_snapshot_get32(snap + 60);
+  nc_remaining = lodepng_snapshot_get32(snap + 64);
+  rows_done = lodepng_snapshot_get32(snap + 68);
+  pass = lodepng_snapshot_get32(snap + 72);
+  row = lodepng_snapshot_get32(snap + 76);
+  adler = lodepng_snapshot_get32(snap + 80);
+  idat_crc = lodepng_snapshot_get32(snap + 84);
+  unf_size = lodepng_snapshot_get32(snap + 88);
+  prevline_size = lodepng_snapshot_get32(snap + 92);
+  have_prevline = lodepng_snapshot_get32(snap + 96);
+  bfinal = lodepng_snapshot_get32(snap + 100);
+
+  /*structural validation of the snapshot itself*/
+  if(interval == 0 || interval > 0xFFFFFFu) goto corrupt;
+  if(window_size < LODEPNG_RESUME_WINDOW_MIN || window_size > LODEPNG_RESUME_WINDOW_MAX) goto corrupt;
+  if(btype > 3) goto corrupt;
+  if(bfinal > 1) goto corrupt;
+  if(btype != 2 && (hlit != 0 || hdist != 0)) goto corrupt;
+  if(btype == 2 && (hlit > NUM_DEFLATE_CODE_SYMBOLS || hdist > NUM_DISTANCE_SYMBOLS)) goto corrupt;
+  if(btype != 3 && nc_remaining != 0) goto corrupt;
+  if(btype == 3 && nc_remaining > 65535) goto corrupt;
+  if(have_prevline > 1) goto corrupt;
+  payload = (btype == 2 ? hlit + hdist : 0) + window_len + prevline_size;
+  if(LODEPNG_RESUME_HEADER_SIZE + payload + 4u != snapsize) goto corrupt;
+  if(window_len != (produced < window_size ? produced : window_size)) goto corrupt;
+  if(produced > expected) goto corrupt;
+
+  /*start a fresh session on the PNG, then verify it matches the snapshot*/
+  s = lodepng_session_begin(in, insize, (unsigned)interval, window_size, &err);
+  if(!s) {
+    if(error) *error = err;
+    return 0;
+  }
+  err = 125; /*default from here on: snapshot does not match the PNG*/
+  if(s->w != w || s->h != h || (unsigned)s->info_png.color.colortype != colortype ||
+     (unsigned)s->info_png.color.bitdepth != bitdepth || s->interlace != interlace ||
+     s->bpp != bpp || s->expected != expected || s->idat_crc != (unsigned)idat_crc ||
+     s->unf_size != unf_size) goto fail;
+
+  err = 124; /*back to: snapshot corrupted or invalid*/
+  if(bp > (s->idatsize - 2) * 8u) goto fail;
+  if(pass > s->num_passes) goto fail;
+  if(pass == s->num_passes) {
+    /*all rows were already unfiltered at the checkpoint*/
+    if(row != 0 || rows_done != s->total_rows || have_prevline != 0 || prevline_size != 0) goto fail;
+  } else {
+    if(s->passh[pass] == 0 || row >= s->passh[pass]) goto fail;
+    rows_check = 0;
+    for(i = 0; i != pass; ++i) rows_check += s->passh[i];
+    rows_check += row;
+    if(rows_done != rows_check) goto fail;
+    if(have_prevline != (row > 0 ? 1u : 0u)) goto fail;
+    if(prevline_size != (have_prevline ? s->linebytes[pass] : 0)) goto fail;
+  }
+  /*the unfiltered rows must be covered by the produced data, and the row being produced
+  must start inside the saved window*/
+  boundary = (pass == s->num_passes) ? s->expected :
+             s->filter_passstart[pass] + row * (s->linebytes[pass] + 1u);
+  if(boundary > produced) goto fail;
+  if(produced - boundary > window_len) goto fail;
+  if(partial_size != s->unf_size) goto fail;
+
+  /*for a dynamic block checkpoint, validate the saved code lengths by building the trees*/
+  if(btype == 2) {
+    HuffmanTree tree_ll, tree_d;
+    LodePNGInflateCheckpoint cp;
+    lodepng_memset(&cp, 0, sizeof(cp));
+    cp.hlit = (unsigned)hlit;
+    cp.hdist = (unsigned)hdist;
+    pos = LODEPNG_RESUME_HEADER_SIZE;
+    for(i = 0; i != hlit; ++i) cp.bitlen_ll[i] = snap[pos + i];
+    pos += hlit;
+    for(i = 0; i != hdist; ++i) cp.bitlen_d[i] = snap[pos + i];
+    for(i = 0; i != hlit; ++i) if(cp.bitlen_ll[i] > 15) goto fail;
+    for(i = 0; i != hdist; ++i) if(cp.bitlen_d[i] > 15) goto fail;
+    HuffmanTree_init(&tree_ll);
+    HuffmanTree_init(&tree_d);
+    err = lodepng_make_trees_from_checkpoint(&tree_ll, &tree_d, &cp);
+    HuffmanTree_cleanup(&tree_ll);
+    HuffmanTree_cleanup(&tree_d);
+    if(err) {
+      err = 124;
+      goto fail;
+    }
+    err = 124;
+  }
+
+  /*apply the snapshot to the session*/
+  s->produced = produced;
+  s->raw_base = produced - window_len;
+  s->raw_size = window_len;
+  s->raw_alloc = window_len;
+  s->raw = (unsigned char*)lodepng_malloc(window_len ? window_len : 1);
+  if(!s->raw) {
+    err = 83; /*alloc fail*/
+    goto fail;
+  }
+  pos = LODEPNG_RESUME_HEADER_SIZE + (btype == 2 ? hlit + hdist : 0);
+  if(window_len) lodepng_memcpy(s->raw, snap + pos, window_len);
+  pos += window_len;
+  if(prevline_size) lodepng_memcpy(s->prevline, snap + pos, prevline_size);
+
+  s->cp.bp = bp;
+  s->cp.produced = produced;
+  s->cp.btype = (unsigned)btype;
+  s->cp.bfinal = (unsigned)bfinal;
+  s->cp.nc_remaining = (unsigned)nc_remaining;
+  if(btype == 2) {
+    s->cp.hlit = (unsigned)hlit;
+    s->cp.hdist = (unsigned)hdist;
+    pos = LODEPNG_RESUME_HEADER_SIZE;
+    for(i = 0; i != hlit; ++i) s->cp.bitlen_ll[i] = snap[pos + i];
+    pos += hlit;
+    for(i = 0; i != hdist; ++i) s->cp.bitlen_d[i] = snap[pos + i];
+  }
+  s->cp_valid = 1;
+  s->adler = (unsigned)adler;
+  s->pass = (unsigned)pass;
+  s->row = (unsigned)row;
+  s->rows_done = rows_done;
+  s->have_prevline = (int)have_prevline;
+  lodepng_memcpy(s->unf, partial, partial_size);
+  lodepng_session_schedule_next(s);
+
+  if(error) *error = 0;
+  return s;
+
+corrupt:
+  err = 124;
+fail:
+  if(s) lodepng_session_destroy(s);
+  if(error) *error = err;
+  return 0;
+}
+
+/*get the final 32-bit RGBA image. Only valid when lodepng_session_is_finished returns 1.
+The out buffer is newly allocated, free with lodepng_free.*/
+unsigned lodepng_session_output(LodePNGDecodeSession* s, unsigned char** out, unsigned* w, unsigned* h) {
+  if(!out) return 126;
+  *out = 0;
+  if(!s) return 126;
+  if(s->error) return s->error;
+  if(!s->finished) return 126;
+  *out = (unsigned char*)lodepng_malloc(s->out_size ? s->out_size : 1);
+  if(!*out) return 83; /*alloc fail*/
+  lodepng_memcpy(*out, s->out, s->out_size);
+  if(w) *w = s->w;
+  if(h) *h = s->h;
+  return 0;
+}
+
+void lodepng_session_destroy(LodePNGDecodeSession* s) {
+  if(!s) return;
+  lodepng_info_cleanup(&s->info_png);
+  lodepng_free(s->idat);
+  lodepng_free(s->raw);
+  lodepng_free(s->prevline);
+  lodepng_free(s->unf);
+  lodepng_free(s->out);
+  lodepng_free(s);
+}
+
 #endif /*LODEPNG_COMPILE_DECODER*/
 
 #if defined(LODEPNG_COMPILE_DECODER) || defined(LODEPNG_COMPILE_ENCODER)
@@ -7055,6 +8084,9 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "decode resume snapshot is corrupted or invalid";
+    case 125: return "decode resume snapshot does not match the given PNG data";
+    case 126: return "invalid decode resume parameter";
   }
   return "unknown error code";
 }
