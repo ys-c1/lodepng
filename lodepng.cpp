@@ -5311,222 +5311,425 @@ unsigned lodepng_inspect_chunk(LodePNGState* state, size_t pos,
   return error;
 }
 
-/*read a PNG, the result will be in the same color type as the PNG (hence "generic")*/
-static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
-                          LodePNGState* state,
-                          const unsigned char* in, size_t insize) {
-  unsigned char IEND = 0;
-  const unsigned char* chunk; /*points to beginning of next chunk*/
-  unsigned char* idat; /*the data from idat chunks, zlib compressed*/
-  size_t idatsize = 0;
-  unsigned char* scanlines = 0;
-  size_t scanlines_size = 0, expected_size = 0;
-  size_t outsize = 0;
+/*
+The PNG decoder core is a small state machine: each stage below is an
+independent function, and all state that used to be local variables of one
+monolithic function lives in LodePNGDecodeCtx (on the stack of decodeGeneric,
+no globals). The stages run in this order:
+  1) HEADER:      parse the PNG header and IHDR chunk, validate dimensions
+  2) CHUNKS:      process chunks one by one (each known type has a callback)
+  3) DECOMPRESS:  zlib-decompress the collected IDAT data
+  4) RECONSTRUCT: unfilter/deinterlace the scanlines into the output image
+*/
 
-  /*for unknown chunk order*/
-  unsigned unknown = 0;
+/*the stages of the decoder state machine, executed in the order listed above*/
+typedef enum LodePNGDecodeStage {
+  LODEPNG_STAGE_HEADER = 0,
+  LODEPNG_STAGE_CHUNKS,
+  LODEPNG_STAGE_DECOMPRESS,
+  LODEPNG_STAGE_RECONSTRUCT,
+  LODEPNG_STAGE_DONE /*reached with or without error*/
+} LodePNGDecodeStage;
+
+/*all state passed between the decoder stages*/
+typedef struct LodePNGDecodeCtx {
+  LodePNGDecodeStage stage; /*current stage of the state machine*/
+
+  /*parameters of decodeGeneric*/
+  unsigned char** out;
+  unsigned* w;
+  unsigned* h;
+  LodePNGState* state;
+  const unsigned char* in;
+  size_t insize;
+
+  /*chunk iteration state (stage LODEPNG_STAGE_CHUNKS)*/
+  const unsigned char* chunk; /*points to beginning of next chunk*/
+  unsigned char iend;         /*true once the IEND chunk has been handled*/
+  unsigned char stop;         /*true to stop the chunk loop early (decoder.ignore_end)*/
+
+  unsigned char* idat; /*the data from idat chunks, zlib compressed*/
+  size_t idatsize;
+
+  unsigned unknown; /*true if the current chunk is of an unknown type*/
 #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
-  unsigned critical_pos = 1; /*1 = after IHDR, 2 = after PLTE, 3 = after IDAT*/
+  unsigned critical_pos; /*for unknown chunk order: 1 = after IHDR, 2 = after PLTE, 3 = after IDAT*/
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 
+  unsigned char* scanlines; /*decompressed data, still filtered/padded/possibly interlaced*/
+  size_t scanlines_size;
+  size_t expected_size; /*expected decompressed size, mismatch means corrupt image*/
+  size_t outsize; /*size of the reconstructed output image*/
+} LodePNGDecodeCtx;
 
-  /* safe output values in case error happens */
-  *out = 0;
-  *w = *h = 0;
+/*callback handling one known chunk type. Returns 0 on success, or an error code
+which the caller stores in ctx->state->error, aborting the chunk loop.*/
+typedef unsigned (*LodePNGChunkHandler)(LodePNGDecodeCtx* ctx,
+                                        const unsigned char* data, unsigned chunkLength);
 
-  state->error = lodepng_inspect(w, h, state, in, insize); /*reads header and resets other parameters in state->info_png*/
-  if(state->error) return;
+/*IDAT chunk, containing compressed image data: append to the data collected so far*/
+static unsigned decodegeneric_handle_IDAT(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  size_t newsize;
+  if(lodepng_addofl(ctx->idatsize, chunkLength, &newsize)) return 95;
+  if(newsize > ctx->insize) return 95; /*error: size of IDAT data larger than input size*/
+  lodepng_memcpy(ctx->idat + ctx->idatsize, data, chunkLength);
+  ctx->idatsize += chunkLength;
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+  ctx->critical_pos = 3;
+#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+  return 0;
+}
 
-  if(lodepng_pixel_overflow(*w, *h, &state->info_png.color, &state->info_raw)) {
-    CERROR_RETURN(state->error, 92); /*overflow possible due to amount of pixels*/
+/*IEND chunk: signal the chunk loop to stop*/
+static unsigned decodegeneric_handle_IEND(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  (void)data;
+  (void)chunkLength;
+  ctx->iend = 1;
+  return 0;
+}
+
+/*palette chunk (PLTE)*/
+static unsigned decodegeneric_handle_PLTE(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  unsigned error = readChunk_PLTE(&ctx->state->info_png.color, data, chunkLength);
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+  if(!error) ctx->critical_pos = 2;
+#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+  return error;
+}
+
+/*palette transparency chunk (tRNS). Even though this one is an ancillary chunk, it is still compiled
+in without 'LODEPNG_COMPILE_ANCILLARY_CHUNKS' because it contains essential color information that
+affects the alpha channel of pixels.*/
+static unsigned decodegeneric_handle_tRNS(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_tRNS(&ctx->state->info_png.color, data, chunkLength);
+}
+
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+/*background color chunk (bKGD)*/
+static unsigned decodegeneric_handle_bKGD(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_bKGD(&ctx->state->info_png, data, chunkLength);
+}
+
+/*text chunk (tEXt)*/
+static unsigned decodegeneric_handle_tEXt(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  if(ctx->state->decoder.read_text_chunks) {
+    return readChunk_tEXt(&ctx->state->info_png, data, chunkLength);
+  }
+  return 0;
+}
+
+/*compressed text chunk (zTXt)*/
+static unsigned decodegeneric_handle_zTXt(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  if(ctx->state->decoder.read_text_chunks) {
+    return readChunk_zTXt(&ctx->state->info_png, &ctx->state->decoder, data, chunkLength);
+  }
+  return 0;
+}
+
+/*international text chunk (iTXt)*/
+static unsigned decodegeneric_handle_iTXt(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  if(ctx->state->decoder.read_text_chunks) {
+    return readChunk_iTXt(&ctx->state->info_png, &ctx->state->decoder, data, chunkLength);
+  }
+  return 0;
+}
+
+static unsigned decodegeneric_handle_tIME(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_tIME(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_pHYs(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_pHYs(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_gAMA(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_gAMA(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_cHRM(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_cHRM(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_sRGB(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_sRGB(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_iCCP(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_iCCP(&ctx->state->info_png, &ctx->state->decoder, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_cICP(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_cICP(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_mDCV(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_mDCV(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_cLLI(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_cLLI(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_eXIf(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_eXIf(&ctx->state->info_png, data, chunkLength);
+}
+
+static unsigned decodegeneric_handle_sBIT(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  return readChunk_sBIT(&ctx->state->info_png, data, chunkLength);
+}
+#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+
+/*maps each known 4-byte chunk type to its handler callback. Read-only lookup
+table: it holds no decoding state, all mutable state is in LodePNGDecodeCtx.*/
+typedef struct LodePNGChunkDispatch {
+  char type[4];
+  LodePNGChunkHandler handler;
+} LodePNGChunkDispatch;
+
+static const LodePNGChunkDispatch lodepng_chunk_dispatch[] = {
+  {{'I', 'D', 'A', 'T'}, decodegeneric_handle_IDAT},
+  {{'I', 'E', 'N', 'D'}, decodegeneric_handle_IEND},
+  {{'P', 'L', 'T', 'E'}, decodegeneric_handle_PLTE},
+  {{'t', 'R', 'N', 'S'}, decodegeneric_handle_tRNS},
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+  {{'b', 'K', 'G', 'D'}, decodegeneric_handle_bKGD},
+  {{'t', 'E', 'X', 't'}, decodegeneric_handle_tEXt},
+  {{'z', 'T', 'X', 't'}, decodegeneric_handle_zTXt},
+  {{'i', 'T', 'X', 't'}, decodegeneric_handle_iTXt},
+  {{'t', 'I', 'M', 'E'}, decodegeneric_handle_tIME},
+  {{'p', 'H', 'Y', 's'}, decodegeneric_handle_pHYs},
+  {{'g', 'A', 'M', 'A'}, decodegeneric_handle_gAMA},
+  {{'c', 'H', 'R', 'M'}, decodegeneric_handle_cHRM},
+  {{'s', 'R', 'G', 'B'}, decodegeneric_handle_sRGB},
+  {{'i', 'C', 'C', 'P'}, decodegeneric_handle_iCCP},
+  {{'c', 'I', 'C', 'P'}, decodegeneric_handle_cICP},
+  {{'m', 'D', 'C', 'V'}, decodegeneric_handle_mDCV},
+  {{'c', 'L', 'L', 'I'}, decodegeneric_handle_cLLI},
+  {{'e', 'X', 'I', 'f'}, decodegeneric_handle_eXIf},
+  {{'s', 'B', 'I', 'T'}, decodegeneric_handle_sBIT},
+#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+};
+
+/*it's not an implemented chunk type, so ignore it: skip over the data*/
+static void decodegeneric_handle_unknown(LodePNGDecodeCtx* ctx) {
+  LodePNGState* state = ctx->state;
+  const unsigned char* chunk = ctx->chunk;
+  if(!lodepng_chunk_type_name_valid(chunk)) {
+    state->error = 121; /*invalid chunk type name*/
+    return;
+  }
+  if(lodepng_chunk_reserved(chunk)) {
+    state->error = 122; /*invalid third lowercase character*/
+    return;
   }
 
-  /*the input filesize is a safe upper bound for the sum of idat chunks size*/
-  idat = (unsigned char*)lodepng_malloc(insize);
-  if(!idat) CERROR_RETURN(state->error, 83); /*alloc fail*/
+  /*error: unknown critical chunk (5th bit of first byte of chunk type is 0)*/
+  if(!state->decoder.ignore_critical && !lodepng_chunk_ancillary(chunk)) {
+    state->error = 69;
+    return;
+  }
 
-  chunk = &in[33]; /*first byte of the first chunk after the header*/
-
-  /*loop through the chunks, ignoring unknown chunks and stopping at IEND chunk.
-  IDAT data is put at the start of the in buffer*/
-  while(!IEND && !state->error) {
-    unsigned chunkLength;
-    const unsigned char* data; /*the data in the chunk*/
-    size_t pos = (size_t)(chunk - in);
-
-    /*error: next chunk out of bounds of the in buffer*/
-    if(chunk < in || pos + 12 > insize) {
-      if(state->decoder.ignore_end) break; /*other errors may still happen though*/
-      CERROR_BREAK(state->error, 30);
-    }
-
-    /*length of the data of the chunk, excluding the 12 bytes for length, chunk type and CRC*/
-    chunkLength = lodepng_chunk_length(chunk);
-    /*error: chunk length larger than the max PNG chunk size*/
-    if(chunkLength > 2147483647) {
-      if(state->decoder.ignore_end) break; /*other errors may still happen though*/
-      CERROR_BREAK(state->error, 63);
-    }
-
-    if(pos + (size_t)chunkLength + 12 > insize || pos + (size_t)chunkLength + 12 < pos) {
-      CERROR_BREAK(state->error, 64); /*error: size of the in buffer too small to contain next chunk (or int overflow)*/
-    }
-
-    data = lodepng_chunk_data_const(chunk);
-
-    unknown = 0;
-
-    /*IDAT chunk, containing compressed image data*/
-    if(lodepng_chunk_type_equals(chunk, "IDAT")) {
-      size_t newsize;
-      if(lodepng_addofl(idatsize, chunkLength, &newsize)) CERROR_BREAK(state->error, 95);
-      if(newsize > insize) CERROR_BREAK(state->error, 95);
-      lodepng_memcpy(idat + idatsize, data, chunkLength);
-      idatsize += chunkLength;
+  ctx->unknown = 1;
 #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
-      critical_pos = 3;
+  if(state->decoder.remember_unknown_chunks) {
+    state->error = lodepng_chunk_append(&state->info_png.unknown_chunks_data[ctx->critical_pos - 1],
+                                        &state->info_png.unknown_chunks_size[ctx->critical_pos - 1], chunk);
+  }
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
-    } else if(lodepng_chunk_type_equals(chunk, "IEND")) {
-      /*IEND chunk*/
-      IEND = 1;
-    } else if(lodepng_chunk_type_equals(chunk, "PLTE")) {
-      /*palette chunk (PLTE)*/
-      state->error = readChunk_PLTE(&state->info_png.color, data, chunkLength);
-      if(state->error) break;
-#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
-      critical_pos = 2;
-#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
-    } else if(lodepng_chunk_type_equals(chunk, "tRNS")) {
-      /*palette transparency chunk (tRNS). Even though this one is an ancillary chunk , it is still compiled
-      in without 'LODEPNG_COMPILE_ANCILLARY_CHUNKS' because it contains essential color information that
-      affects the alpha channel of pixels. */
-      state->error = readChunk_tRNS(&state->info_png.color, data, chunkLength);
-      if(state->error) break;
-#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
-      /*background color chunk (bKGD)*/
-    } else if(lodepng_chunk_type_equals(chunk, "bKGD")) {
-      state->error = readChunk_bKGD(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "tEXt")) {
-      /*text chunk (tEXt)*/
-      if(state->decoder.read_text_chunks) {
-        state->error = readChunk_tEXt(&state->info_png, data, chunkLength);
-        if(state->error) break;
-      }
-    } else if(lodepng_chunk_type_equals(chunk, "zTXt")) {
-      /*compressed text chunk (zTXt)*/
-      if(state->decoder.read_text_chunks) {
-        state->error = readChunk_zTXt(&state->info_png, &state->decoder, data, chunkLength);
-        if(state->error) break;
-      }
-    } else if(lodepng_chunk_type_equals(chunk, "iTXt")) {
-      /*international text chunk (iTXt)*/
-      if(state->decoder.read_text_chunks) {
-        state->error = readChunk_iTXt(&state->info_png, &state->decoder, data, chunkLength);
-        if(state->error) break;
-      }
-    } else if(lodepng_chunk_type_equals(chunk, "tIME")) {
-      state->error = readChunk_tIME(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "pHYs")) {
-      state->error = readChunk_pHYs(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "gAMA")) {
-      state->error = readChunk_gAMA(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "cHRM")) {
-      state->error = readChunk_cHRM(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "sRGB")) {
-      state->error = readChunk_sRGB(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "iCCP")) {
-      state->error = readChunk_iCCP(&state->info_png, &state->decoder, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "cICP")) {
-      state->error = readChunk_cICP(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "mDCV")) {
-      state->error = readChunk_mDCV(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "cLLI")) {
-      state->error = readChunk_cLLI(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "eXIf")) {
-      state->error = readChunk_eXIf(&state->info_png, data, chunkLength);
-      if(state->error) break;
-    } else if(lodepng_chunk_type_equals(chunk, "sBIT")) {
-      state->error = readChunk_sBIT(&state->info_png, data, chunkLength);
-      if(state->error) break;
-#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
-    } else /*it's not an implemented chunk type, so ignore it: skip over the data*/ {
-      if(!lodepng_chunk_type_name_valid(chunk)) {
-        CERROR_BREAK(state->error, 121); /* invalid chunk type name */
-      }
-      if(lodepng_chunk_reserved(chunk)) {
-        CERROR_BREAK(state->error, 122); /* invalid third lowercase character */
-      }
+}
 
-      /*error: unknown critical chunk (5th bit of first byte of chunk type is 0)*/
-      if(!state->decoder.ignore_critical && !lodepng_chunk_ancillary(chunk)) {
-        CERROR_BREAK(state->error, 69);
-      }
-
-      unknown = 1;
-#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
-      if(state->decoder.remember_unknown_chunks) {
-        state->error = lodepng_chunk_append(&state->info_png.unknown_chunks_data[critical_pos - 1],
-                                            &state->info_png.unknown_chunks_size[critical_pos - 1], chunk);
-        if(state->error) break;
-      }
-#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+/*finds the callback for the chunk type at ctx->chunk and runs it, or handles it as unknown*/
+static void decodegeneric_dispatch_chunk(LodePNGDecodeCtx* ctx, const unsigned char* data, unsigned chunkLength) {
+  const unsigned char* type = ctx->chunk + 4; /*chunk type bytes*/
+  size_t i, num = sizeof(lodepng_chunk_dispatch) / sizeof(lodepng_chunk_dispatch[0]);
+  for(i = 0; i != num; ++i) {
+    const LodePNGChunkDispatch* d = &lodepng_chunk_dispatch[i];
+    if(type[0] == (unsigned char)d->type[0] && type[1] == (unsigned char)d->type[1]
+       && type[2] == (unsigned char)d->type[2] && type[3] == (unsigned char)d->type[3]) {
+      ctx->state->error = d->handler(ctx, data, chunkLength);
+      return;
     }
+  }
+  decodegeneric_handle_unknown(ctx);
+}
 
-    if(!state->decoder.ignore_crc && !unknown) /*check CRC if wanted, only on known chunk types*/ {
-      if(lodepng_chunk_check_crc(chunk)) CERROR_BREAK(state->error, 57); /*invalid CRC*/
+/*processes the single chunk at ctx->chunk and advances ctx->chunk to the next one*/
+static void decodegeneric_process_chunk(LodePNGDecodeCtx* ctx) {
+  LodePNGState* state = ctx->state;
+  unsigned chunkLength;
+  const unsigned char* data; /*the data in the chunk*/
+  size_t pos = (size_t)(ctx->chunk - ctx->in);
+
+  /*error: next chunk out of bounds of the in buffer*/
+  if(ctx->chunk < ctx->in || pos + 12 > ctx->insize) {
+    if(state->decoder.ignore_end) ctx->stop = 1; /*other errors may still happen though*/
+    else state->error = 30;
+    return;
+  }
+
+  /*length of the data of the chunk, excluding the 12 bytes for length, chunk type and CRC*/
+  chunkLength = lodepng_chunk_length(ctx->chunk);
+  /*error: chunk length larger than the max PNG chunk size*/
+  if(chunkLength > 2147483647) {
+    if(state->decoder.ignore_end) ctx->stop = 1; /*other errors may still happen though*/
+    else state->error = 63;
+    return;
+  }
+
+  if(pos + (size_t)chunkLength + 12 > ctx->insize || pos + (size_t)chunkLength + 12 < pos) {
+    state->error = 64; /*error: size of the in buffer too small to contain next chunk (or int overflow)*/
+    return;
+  }
+
+  data = lodepng_chunk_data_const(ctx->chunk);
+
+  ctx->unknown = 0;
+  decodegeneric_dispatch_chunk(ctx, data, chunkLength);
+  if(state->error) return;
+
+  if(!state->decoder.ignore_crc && !ctx->unknown) /*check CRC if wanted, only on known chunk types*/ {
+    if(lodepng_chunk_check_crc(ctx->chunk)) {
+      state->error = 57; /*invalid CRC*/
+      return;
     }
+  }
 
-    if(!IEND) chunk = lodepng_chunk_next_const(chunk, in + insize);
+  if(!ctx->iend) ctx->chunk = lodepng_chunk_next_const(ctx->chunk, ctx->in + ctx->insize);
+}
+
+/*stage 1: read the PNG header and IHDR chunk, validate the dimensions*/
+static void decodegeneric_parse_header(LodePNGDecodeCtx* ctx) {
+  LodePNGState* state = ctx->state;
+
+  /*reads header and resets other parameters in state->info_png*/
+  state->error = lodepng_inspect(ctx->w, ctx->h, state, ctx->in, ctx->insize);
+
+  if(!state->error && lodepng_pixel_overflow(*ctx->w, *ctx->h, &state->info_png.color, &state->info_raw)) {
+    state->error = 92; /*overflow possible due to amount of pixels*/
+  }
+
+  if(!state->error) {
+    /*the input filesize is a safe upper bound for the sum of idat chunks size*/
+    ctx->idat = (unsigned char*)lodepng_malloc(ctx->insize);
+    if(!ctx->idat) state->error = 83; /*alloc fail*/
+  }
+
+  if(!state->error) ctx->chunk = &ctx->in[33]; /*first byte of the first chunk after the header*/
+
+  ctx->stage = LODEPNG_STAGE_CHUNKS;
+}
+
+/*stage 2: loop through the chunks, ignoring unknown chunks and stopping at the
+IEND chunk. IDAT data is collected into the idat buffer by the IDAT callback.*/
+static void decodegeneric_process_chunks(LodePNGDecodeCtx* ctx) {
+  LodePNGState* state = ctx->state;
+
+  while(!ctx->iend && !ctx->stop && !state->error) {
+    decodegeneric_process_chunk(ctx);
   }
 
   if(!state->error && state->info_png.color.colortype == LCT_PALETTE && !state->info_png.color.palette) {
-    state->error = 106; /* error: PNG file must have PLTE chunk if color type is palette */
+    state->error = 106; /*error: PNG file must have PLTE chunk if color type is palette*/
   }
+
+  ctx->stage = LODEPNG_STAGE_DECOMPRESS;
+}
+
+/*stage 3: zlib-decompress the collected IDAT data into the scanlines buffer*/
+static void decodegeneric_decompress(LodePNGDecodeCtx* ctx) {
+  LodePNGState* state = ctx->state;
 
   if(!state->error) {
     /*predict output size, to allocate exact size for output buffer to avoid more dynamic allocation.
     If the decompressed size does not match the prediction, the image must be corrupt.*/
+    unsigned bpp = lodepng_get_bpp(&state->info_png.color);
     if(state->info_png.interlace_method == 0) {
-      unsigned bpp = lodepng_get_bpp(&state->info_png.color);
-      expected_size = lodepng_get_raw_size_idat(*w, *h, bpp);
+      ctx->expected_size = lodepng_get_raw_size_idat(*ctx->w, *ctx->h, bpp);
     } else {
-      unsigned bpp = lodepng_get_bpp(&state->info_png.color);
       /*Adam-7 interlaced: expected size is the sum of the 7 sub-images sizes*/
-      expected_size = 0;
-      expected_size += lodepng_get_raw_size_idat((*w + 7) >> 3, (*h + 7) >> 3, bpp);
-      if(*w > 4) expected_size += lodepng_get_raw_size_idat((*w + 3) >> 3, (*h + 7) >> 3, bpp);
-      expected_size += lodepng_get_raw_size_idat((*w + 3) >> 2, (*h + 3) >> 3, bpp);
-      if(*w > 2) expected_size += lodepng_get_raw_size_idat((*w + 1) >> 2, (*h + 3) >> 2, bpp);
-      expected_size += lodepng_get_raw_size_idat((*w + 1) >> 1, (*h + 1) >> 2, bpp);
-      if(*w > 1) expected_size += lodepng_get_raw_size_idat((*w + 0) >> 1, (*h + 1) >> 1, bpp);
-      expected_size += lodepng_get_raw_size_idat((*w + 0), (*h + 0) >> 1, bpp);
+      ctx->expected_size = 0;
+      ctx->expected_size += lodepng_get_raw_size_idat((*ctx->w + 7) >> 3, (*ctx->h + 7) >> 3, bpp);
+      if(*ctx->w > 4) ctx->expected_size += lodepng_get_raw_size_idat((*ctx->w + 3) >> 3, (*ctx->h + 7) >> 3, bpp);
+      ctx->expected_size += lodepng_get_raw_size_idat((*ctx->w + 3) >> 2, (*ctx->h + 3) >> 3, bpp);
+      if(*ctx->w > 2) ctx->expected_size += lodepng_get_raw_size_idat((*ctx->w + 1) >> 2, (*ctx->h + 3) >> 2, bpp);
+      ctx->expected_size += lodepng_get_raw_size_idat((*ctx->w + 1) >> 1, (*ctx->h + 1) >> 2, bpp);
+      if(*ctx->w > 1) ctx->expected_size += lodepng_get_raw_size_idat((*ctx->w + 0) >> 1, (*ctx->h + 1) >> 1, bpp);
+      ctx->expected_size += lodepng_get_raw_size_idat((*ctx->w + 0), (*ctx->h + 0) >> 1, bpp);
     }
 
-    state->error = zlib_decompress(&scanlines, &scanlines_size, expected_size, idat, idatsize, &state->decoder.zlibsettings);
+    state->error = zlib_decompress(&ctx->scanlines, &ctx->scanlines_size, ctx->expected_size,
+                                   ctx->idat, ctx->idatsize, &state->decoder.zlibsettings);
   }
-  if(!state->error && scanlines_size != expected_size) state->error = 91; /*decompressed size doesn't match prediction*/
-  lodepng_free(idat);
+  if(!state->error && ctx->scanlines_size != ctx->expected_size) state->error = 91; /*decompressed size doesn't match prediction*/
+  lodepng_free(ctx->idat);
+  ctx->idat = 0;
+
+  ctx->stage = LODEPNG_STAGE_RECONSTRUCT;
+}
+
+/*stage 4: unfilter, remove padding bits and deinterlace into the output image*/
+static void decodegeneric_reconstruct(LodePNGDecodeCtx* ctx) {
+  LodePNGState* state = ctx->state;
 
   if(!state->error) {
-    outsize = lodepng_get_raw_size(*w, *h, &state->info_png.color);
-    *out = (unsigned char*)lodepng_malloc(outsize);
-    if(!*out) state->error = 83; /*alloc fail*/
+    ctx->outsize = lodepng_get_raw_size(*ctx->w, *ctx->h, &state->info_png.color);
+    *ctx->out = (unsigned char*)lodepng_malloc(ctx->outsize);
+    if(!*ctx->out) state->error = 83; /*alloc fail*/
   }
   if(!state->error) {
-    lodepng_memset(*out, 0, outsize);
-    state->error = postProcessScanlines(*out, scanlines, *w, *h, &state->info_png);
+    lodepng_memset(*ctx->out, 0, ctx->outsize);
+    state->error = postProcessScanlines(*ctx->out, ctx->scanlines, *ctx->w, *ctx->h, &state->info_png);
   }
-  lodepng_free(scanlines);
+  lodepng_free(ctx->scanlines);
+  ctx->scanlines = 0;
+
+  ctx->stage = LODEPNG_STAGE_DONE;
+}
+
+static void decodegeneric_init(LodePNGDecodeCtx* ctx, unsigned char** out, unsigned* w, unsigned* h,
+                               LodePNGState* state, const unsigned char* in, size_t insize) {
+  ctx->stage = LODEPNG_STAGE_HEADER;
+  ctx->out = out;
+  ctx->w = w;
+  ctx->h = h;
+  ctx->state = state;
+  ctx->in = in;
+  ctx->insize = insize;
+  ctx->chunk = 0;
+  ctx->iend = 0;
+  ctx->stop = 0;
+  ctx->idat = 0;
+  ctx->idatsize = 0;
+  ctx->unknown = 0;
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+  ctx->critical_pos = 1; /*1 = after IHDR, 2 = after PLTE, 3 = after IDAT*/
+#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+  ctx->scanlines = 0;
+  ctx->scanlines_size = 0;
+  ctx->expected_size = 0;
+  ctx->outsize = 0;
+
+  /*safe output values in case error happens*/
+  *out = 0;
+  *w = *h = 0;
+}
+
+/*read a PNG, the result will be in the same color type as the PNG (hence "generic").
+Runs the decoder stages as a state machine; all state is in the ctx on the stack.*/
+static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
+                          LodePNGState* state,
+                          const unsigned char* in, size_t insize) {
+  LodePNGDecodeCtx ctx;
+  decodegeneric_init(&ctx, out, w, h, state, in, insize);
+  while(ctx.stage != LODEPNG_STAGE_DONE) {
+    switch(ctx.stage) {
+      case LODEPNG_STAGE_HEADER: decodegeneric_parse_header(&ctx); break;
+      case LODEPNG_STAGE_CHUNKS: decodegeneric_process_chunks(&ctx); break;
+      case LODEPNG_STAGE_DECOMPRESS: decodegeneric_decompress(&ctx); break;
+      case LODEPNG_STAGE_RECONSTRUCT: decodegeneric_reconstruct(&ctx); break;
+      default: ctx.stage = LODEPNG_STAGE_DONE; break; /*unreachable: all stages handled above*/
+    }
+  }
 }
 
 unsigned lodepng_decode(unsigned char** out, unsigned* w, unsigned* h,
@@ -5534,39 +5737,36 @@ unsigned lodepng_decode(unsigned char** out, unsigned* w, unsigned* h,
                         const unsigned char* in, size_t insize) {
   *out = 0;
   decodeGeneric(out, w, h, state, in, insize);
-  if(state->error) goto cleanup;
-  if(!state->decoder.color_convert || lodepng_color_mode_equal(&state->info_raw, &state->info_png.color)) {
-    /*same color type, no copying or converting of data needed*/
-    /*store the info_png color settings on the info_raw so that the info_raw still reflects what colortype
-    the raw image has to the end user*/
-    if(!state->decoder.color_convert) {
-      state->error = lodepng_color_mode_copy(&state->info_raw, &state->info_png.color);
-      if(state->error) goto cleanup;
-    }
-  } else { /*color conversion needed*/
-    unsigned char* data = *out;
-    size_t outsize;
+  if(!state->error) {
+    if(!state->decoder.color_convert || lodepng_color_mode_equal(&state->info_raw, &state->info_png.color)) {
+      /*same color type, no copying or converting of data needed*/
+      /*store the info_png color settings on the info_raw so that the info_raw still reflects what colortype
+      the raw image has to the end user*/
+      if(!state->decoder.color_convert) {
+        state->error = lodepng_color_mode_copy(&state->info_raw, &state->info_png.color);
+      }
+    } else { /*color conversion needed*/
+      unsigned char* data = *out;
 
-    /*TODO: check if this works according to the statement in the documentation: "The converter can convert
-    from grayscale input color type, to 8-bit grayscale or grayscale with alpha"*/
-    if(!(state->info_raw.colortype == LCT_RGB || state->info_raw.colortype == LCT_RGBA)
-       && !(state->info_raw.bitdepth == 8)) {
-      state->error = 56; /*unsupported color mode conversion*/
-      goto cleanup;
+      /*TODO: check if this works according to the statement in the documentation: "The converter can convert
+      from grayscale input color type, to 8-bit grayscale or grayscale with alpha"*/
+      if(!(state->info_raw.colortype == LCT_RGB || state->info_raw.colortype == LCT_RGBA)
+         && !(state->info_raw.bitdepth == 8)) {
+        state->error = 56; /*unsupported color mode conversion*/
+      } else {
+        size_t outsize = lodepng_get_raw_size(*w, *h, &state->info_raw);
+        *out = (unsigned char*)lodepng_malloc(outsize);
+        if(!(*out)) {
+          state->error = 83; /*alloc fail*/
+        } else {
+          state->error = lodepng_convert(*out, data, &state->info_raw,
+                                         &state->info_png.color, *w, *h);
+        }
+        lodepng_free(data);
+      }
     }
-
-    outsize = lodepng_get_raw_size(*w, *h, &state->info_raw);
-    *out = (unsigned char*)lodepng_malloc(outsize);
-    if(!(*out)) {
-      state->error = 83; /*alloc fail*/
-    } else {
-      state->error = lodepng_convert(*out, data, &state->info_raw,
-                                     &state->info_png.color, *w, *h);
-    }
-    lodepng_free(data);
   }
 
-cleanup:
   if(state->error) {
     lodepng_free(*out);
     *out = 0;
