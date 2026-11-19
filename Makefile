@@ -14,6 +14,16 @@ override CXXFLAGS := -W -Wall -Wextra -ansi -pedantic -O3 $(CXXFLAGS)
 
 all: unittest benchmark pngdetail showpng
 
+# Incremental/resumable decoder: equivalence suite and timing comparison.
+# These are add-on targets; the existing targets above are unchanged.
+incremental_test: lodepng.o incremental_test.o
+	$(CXX) $^ $(CXXFLAGS) -o $@
+
+incremental_bench: lodepng.o incremental_bench.o
+	$(CXX) $^ $(CXXFLAGS) -o $@
+
+incremental: incremental_test incremental_bench
+
 %.o: %.cpp
 	@mkdir -p `dirname $@`
 	$(CXX) -I ./ $(CXXFLAGS) -c $< -o $@
@@ -31,4 +41,4 @@ showpng: lodepng.o examples/example_sdl.o
 	$(CXX) -I ./ $^ $(CXXFLAGS) -lSDL2 -o $@
 
 clean:
-	rm -f unittest benchmark pngdetail showpng lodepng_unittest.o lodepng_benchmark.o lodepng.o lodepng_util.o pngdetail.o examples/example_sdl.o
+	rm -f unittest benchmark pngdetail showpng lodepng_unittest.o lodepng_benchmark.o lodepng.o lodepng_util.o pngdetail.o examples/example_sdl.o incremental_test incremental_bench incremental_test.o incremental_bench.o
